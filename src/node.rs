@@ -104,6 +104,19 @@ impl Node {
                     let key_bytes = key.as_bytes();
                     let value_bytes = value.as_bytes();
 
+                    // Check if this pair would exceed page size
+                    let pair_size = 4 + key_bytes.len() + 4 + value_bytes.len();
+                    if cursor.position() as usize + pair_size > PAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Node data exceeds page size: {} bytes at position {}",
+                                pair_size,
+                                cursor.position()
+                            ),
+                        ));
+                    }
+
                     // Write key length and key bytes
                     cursor.write_u32::<LittleEndian>(key_bytes.len() as u32)?;
                     cursor.write_all(key_bytes)?;
@@ -117,12 +130,29 @@ impl Node {
                 // Serialize keys
                 for key in keys {
                     let key_bytes = key.as_bytes();
+                    let key_size = 4 + key_bytes.len();
+                    if cursor.position() as usize + key_size > PAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Node data exceeds page size: {} bytes at position {}",
+                                key_size,
+                                cursor.position()
+                            ),
+                        ));
+                    }
                     cursor.write_u32::<LittleEndian>(key_bytes.len() as u32)?;
                     cursor.write_all(key_bytes)?;
                 }
 
                 // Serialize children (page IDs)
                 for &child_id in children {
+                    if cursor.position() as usize + 4 > PAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Node data exceeds page size when writing children",
+                        ));
+                    }
                     cursor.write_u32::<LittleEndian>(child_id)?;
                 }
             }

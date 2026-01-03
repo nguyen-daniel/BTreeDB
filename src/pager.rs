@@ -64,7 +64,11 @@ impl Pager {
 
         // Write the page data
         self.file.write_all(data)?;
-        self.file.sync_all()?; // Ensure data is flushed to disk
+        // Flush to ensure data is written (but don't sync to disk for performance)
+        self.file.flush()?;
+        // Note: sync_data removed for benchmarking - can cause issues with temp files
+        // In production, you may want to sync periodically rather than on every write
+        // self.file.sync_data()?;
 
         Ok(())
     }

@@ -3,7 +3,8 @@ use crate::pager::Pager;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
-const MAX_LEAF_KEYS: usize = 10;
+const MAX_LEAF_KEYS: usize = 3; // Reduced to 3 to support 1KB values (1024 bytes) in 4KB pages
+const MAX_INTERNAL_KEYS: usize = 10; // Maximum keys in an internal node
 const HEADER_SIZE: usize = 100;
 const MAGIC_BYTES: &[u8] = b"BTREEDB";
 const MAGIC_BYTES_LEN: usize = 7;
@@ -305,11 +306,17 @@ impl BTree {
                         keys.insert(insert_pos, separator_key);
                         children.insert(insert_pos + 1, new_page_id);
 
-                        // Update the internal node
-                        let updated_node = Node::new_internal(keys, children);
-                        let buffer = updated_node.serialize()?;
-                        self.pager.write_page(page_id, &buffer)?;
-                        Ok(InsertResult::NoSplit)
+                        // Check if we need to split the internal node
+                        if keys.len() > MAX_INTERNAL_KEYS {
+                            let split_result = self.split_internal(page_id, keys, children)?;
+                            Ok(split_result)
+                        } else {
+                            // Update the internal node
+                            let updated_node = Node::new_internal(keys, children);
+                            let buffer = updated_node.serialize()?;
+                            self.pager.write_page(page_id, &buffer)?;
+                            Ok(InsertResult::NoSplit)
+                        }
                     }
                 }
             }
@@ -342,6 +349,44 @@ impl BTree {
 
         // The separator key is the first key of the new (right) node
         let separator_key = right_pairs[0].0.clone();
+
+        Ok(InsertResult::Split {
+            separator_key,
+            new_page_id,
+        })
+    }
+
+    /// Splits an internal node that has exceeded MAX_INTERNAL_KEYS.
+    /// Moves half the keys and children to a new internal node.
+    /// Returns the separator key (middle key) and the new page ID.
+    fn split_internal(
+        &mut self,
+        page_id: u32,
+        keys: Vec<String>,
+        children: Vec<u32>,
+    ) -> io::Result<InsertResult> {
+        let split_point = keys.len() / 2;
+        let separator_key = keys[split_point].clone();
+
+        // Split keys: left gets keys[0..split_point], right gets keys[split_point+1..]
+        let (left_keys, right_keys_with_sep) = keys.split_at(split_point);
+        let right_keys = right_keys_with_sep[1..].to_vec();
+
+        // Split children: left gets children[0..split_point+1], right gets children[split_point+1..]
+        let (left_children, right_children) = children.split_at(split_point + 1);
+
+        // Create new internal node with the right half
+        let new_internal = Node::new_internal(right_keys, right_children.to_vec());
+        let new_page_id = self.next_page_id;
+        self.next_page_id += 1;
+
+        let new_buffer = new_internal.serialize()?;
+        self.pager.write_page(new_page_id, &new_buffer)?;
+
+        // Update the original internal node with the left half
+        let updated_internal = Node::new_internal(left_keys.to_vec(), left_children.to_vec());
+        let updated_buffer = updated_internal.serialize()?;
+        self.pager.write_page(page_id, &updated_buffer)?;
 
         Ok(InsertResult::Split {
             separator_key,

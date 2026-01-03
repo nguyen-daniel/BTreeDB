@@ -181,19 +181,30 @@ cargo test --test integration_test
 
 ### Running Benchmarks
 
-Performance benchmarks measure insertion performance as the B-Tree grows from 1,000 to 100,000 keys:
+Performance benchmarks measure various aspects of the database:
 
 ```bash
 # Run all benchmarks
-cargo bench
+cargo bench --bench bench
 
-# Run specific benchmark group
-cargo bench --bench bench insertion_at_size
+# Throughput (Writes/Sec): Measure how many 1KB records can be inserted per second
+cargo bench --bench bench -- write_throughput
+
+# Lookup Latency (ms): Compare B-Tree index lookup vs linear scan
+cargo bench --bench bench -- lookup_latency
+
+# Storage Efficiency: Compare raw data size to total file size (overhead percentage)
+cargo bench --bench bench -- storage_efficiency
+
+# Recovery Time: Measure how quickly the database reloads its state after a crash simulation
+cargo bench --bench bench -- recovery_time
 ```
 
 The benchmarks generate HTML reports in `target/criterion/` showing:
-- Nanoseconds per insertion at different tree sizes
-- Sequential insertion performance
+- Throughput measurements (writes per second) at various milestones
+- Lookup latency comparison between B-Tree index and linear scan
+- Storage efficiency metrics (raw data size vs total file size with overhead percentage)
+- Recovery time measurements for different database sizes
 - Statistical analysis with confidence intervals
 
 ### Code Quality
