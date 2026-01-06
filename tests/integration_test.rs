@@ -279,7 +279,12 @@ fn test_inserts_after_reopen_no_page_overwrite() {
             let key = format!("session1_key_{:04}", i);
             let expected = format!("session1_value_{}", i);
             let result = btree.get(&key).expect("Failed to get key");
-            assert_eq!(result, Some(expected), "Session 1 key {} missing before close", i);
+            assert_eq!(
+                result,
+                Some(expected),
+                "Session 1 key {} missing before close",
+                i
+            );
         }
 
         btree.sync().expect("Failed to sync");
@@ -294,7 +299,10 @@ fn test_inserts_after_reopen_no_page_overwrite() {
         let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
 
         // First, verify session 1 keys are still accessible
-        println!("Session 2: Verifying {} keys from session 1...", KEYS_SESSION_1);
+        println!(
+            "Session 2: Verifying {} keys from session 1...",
+            KEYS_SESSION_1
+        );
         for i in 0..KEYS_SESSION_1 {
             let key = format!("session1_key_{:04}", i);
             let expected = format!("session1_value_{}", i);
@@ -318,7 +326,10 @@ fn test_inserts_after_reopen_no_page_overwrite() {
         }
 
         // Verify ALL keys (from both sessions) are present
-        println!("Session 2: Verifying all {} keys...", KEYS_SESSION_1 + KEYS_SESSION_2);
+        println!(
+            "Session 2: Verifying all {} keys...",
+            KEYS_SESSION_1 + KEYS_SESSION_2
+        );
 
         // Check session 1 keys are STILL present (this would fail with the old bug)
         for i in 0..KEYS_SESSION_1 {
@@ -351,20 +362,33 @@ fn test_inserts_after_reopen_no_page_overwrite() {
         let pager = Pager::new(file);
         let mut btree = BTree::new(pager).expect("Failed to re-open BTree for final check");
 
-        println!("Session 3: Final verification of all {} keys...", KEYS_SESSION_1 + KEYS_SESSION_2);
+        println!(
+            "Session 3: Final verification of all {} keys...",
+            KEYS_SESSION_1 + KEYS_SESSION_2
+        );
 
         for i in 0..KEYS_SESSION_1 {
             let key = format!("session1_key_{:04}", i);
             let expected = format!("session1_value_{}", i);
             let result = btree.get(&key).expect("Failed to get key");
-            assert_eq!(result, Some(expected), "Session 1 key {} missing in final check", i);
+            assert_eq!(
+                result,
+                Some(expected),
+                "Session 1 key {} missing in final check",
+                i
+            );
         }
 
         for i in 0..KEYS_SESSION_2 {
             let key = format!("session2_key_{:04}", i);
             let expected = format!("session2_value_{}", i);
             let result = btree.get(&key).expect("Failed to get key");
-            assert_eq!(result, Some(expected), "Session 2 key {} missing in final check", i);
+            assert_eq!(
+                result,
+                Some(expected),
+                "Session 2 key {} missing in final check",
+                i
+            );
         }
 
         drop(btree);

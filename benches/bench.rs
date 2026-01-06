@@ -3,8 +3,8 @@ use btreedb::pager::Pager;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -14,10 +14,10 @@ fn create_btree() -> (BTree, PathBuf) {
     // Create temp file in workspace to avoid sandbox permission issues
     let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file_path = PathBuf::from(format!("target/bench_db_{}.bin", counter));
-    
+
     // Remove file if it exists
     let _ = std::fs::remove_file(&file_path);
-    
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -130,12 +130,7 @@ fn bench_write_throughput(c: &mut Criterion) {
     // Test at various milestones (reduced to avoid disk space issues)
     // With 1KB values and MAX_LEAF_KEYS=3, large datasets consume significant disk space
     // 100K records ≈ 100MB+, 250K ≈ 250MB+ per benchmark iteration
-    let milestones = vec![
-        10_000,
-        50_000,
-        100_000,
-        250_000,
-    ];
+    let milestones = vec![10_000, 50_000, 100_000, 250_000];
 
     for &target_count in &milestones {
         group.bench_with_input(
@@ -148,23 +143,21 @@ fn bench_write_throughput(c: &mut Criterion) {
                         // Create 1KB value (1024 bytes)
                         // Note: MAX_LEAF_KEYS is set to 3 to accommodate 1KB values in 4KB pages
                         let value_1kb = "x".repeat(1024);
-                        
+
                         let start = Instant::now();
                         for i in 0..target_count {
                             let key = format!("key_{:010}", i);
-                            btree
-                                .insert(&key, &value_1kb)
-                                .expect("Failed to insert");
+                            btree.insert(&key, &value_1kb).expect("Failed to insert");
                         }
                         let elapsed = start.elapsed();
-                        
+
                         // Calculate and print throughput
                         let writes_per_sec = target_count as f64 / elapsed.as_secs_f64();
                         eprintln!(
                             "Inserted {} records in {:?} ({:.2} writes/sec)",
                             target_count, elapsed, writes_per_sec
                         );
-                        
+
                         black_box(btree);
                     },
                 );
@@ -197,20 +190,20 @@ fn bench_lookup_latency(c: &mut Criterion) {
                         let (mut btree, file_path) = create_btree();
                         // Use 1KB values (1024 bytes) - MAX_LEAF_KEYS is set to 3 to support this
                         let value_1kb = "x".repeat(1024);
-                        
+
                         // Insert all records
                         for i in 0..db_size {
                             let key = format!("key_{:010}", i);
                             btree.insert(&key, &value_1kb).expect("Failed to insert");
                         }
-                        
+
                         // Sync and drop to ensure data is written
                         btree.sync().expect("Failed to sync");
                         drop(btree);
-                        
+
                         // Get test key (middle key for consistency)
                         let test_key = format!("key_{:010}", db_size / 2);
-                        
+
                         (file_path, test_key)
                     },
                     |(file_path, test_key)| {
@@ -229,7 +222,7 @@ fn bench_lookup_latency(c: &mut Criterion) {
                 );
             },
         );
-        
+
         // Test linear scan (in-memory for comparison)
         group.bench_with_input(
             BenchmarkId::new("linear_scan", db_size),
@@ -246,7 +239,7 @@ fn bench_lookup_latency(c: &mut Criterion) {
                                 (key, value_1kb.clone())
                             })
                             .collect();
-                        
+
                         let test_key = format!("key_{:010}", db_size / 2);
                         (data, test_key)
                     },
@@ -283,16 +276,16 @@ fn bench_storage_efficiency(c: &mut Criterion) {
                         let (mut btree, file_path) = create_btree();
                         // Use 1KB values (1024 bytes) - MAX_LEAF_KEYS is set to 3 to support this
                         let value_1kb = "x".repeat(1024);
-                        
+
                         // Insert all records
                         for i in 0..db_size {
                             let key = format!("key_{:010}", i);
                             btree.insert(&key, &value_1kb).expect("Failed to insert");
                         }
-                        
+
                         // Sync to ensure all data is written
                         btree.sync().expect("Failed to sync");
-                        
+
                         (btree, file_path)
                     },
                     |(_btree, file_path)| {
@@ -301,12 +294,12 @@ fn bench_storage_efficiency(c: &mut Criterion) {
                         let key_size = 14; // "key_0000000000"
                         let value_size = 1024;
                         let raw_data_size = db_size as u64 * (key_size + value_size);
-                        
+
                         // Get actual file size
                         let file_size = std::fs::metadata(&file_path)
                             .expect("Failed to get file metadata")
                             .len();
-                        
+
                         // Calculate overhead
                         let overhead_bytes = file_size.saturating_sub(raw_data_size);
                         let overhead_percent = if raw_data_size > 0 {
@@ -314,11 +307,8 @@ fn bench_storage_efficiency(c: &mut Criterion) {
                         } else {
                             0.0
                         };
-                        
-                        eprintln!(
-                            "Database size: {} records",
-                            db_size
-                        );
+
+                        eprintln!("Database size: {} records", db_size);
                         eprintln!(
                             "Raw data size: {} bytes ({:.2} MB)",
                             raw_data_size,
@@ -333,7 +323,7 @@ fn bench_storage_efficiency(c: &mut Criterion) {
                             "Overhead: {} bytes ({:.2}%)",
                             overhead_bytes, overhead_percent
                         );
-                        
+
                         black_box((raw_data_size, file_size, overhead_percent));
                     },
                 );
@@ -365,25 +355,25 @@ fn bench_recovery_time(c: &mut Criterion) {
                         let (mut btree, file_path) = create_btree();
                         // Use 1KB values (1024 bytes) - MAX_LEAF_KEYS is set to 3 to support this
                         let value_1kb = "x".repeat(1024);
-                        
+
                         // Insert all records
                         for i in 0..db_size {
                             let key = format!("key_{:010}", i);
                             btree.insert(&key, &value_1kb).expect("Failed to insert");
                         }
-                        
+
                         // Sync to ensure all data is written
                         btree.sync().expect("Failed to sync");
-                        
+
                         // Drop the BTree to simulate a crash
                         drop(btree);
-                        
+
                         file_path
                     },
                     |file_path| {
                         // Benchmark: Reopen the database (recovery)
                         let start = Instant::now();
-                        
+
                         let file = OpenOptions::new()
                             .read(true)
                             .write(true)
@@ -391,13 +381,13 @@ fn bench_recovery_time(c: &mut Criterion) {
                             .expect("Failed to reopen file");
                         let pager = Pager::new(file);
                         let btree = BTree::new(pager).expect("Failed to recover BTree");
-                        
+
                         let elapsed = start.elapsed();
-                        
+
                         // Verify recovery by reading root page ID
                         let root_id = btree.root_page_id();
                         black_box(root_id);
-                        
+
                         eprintln!(
                             "Recovery time for {} records: {:?} ({:.2} ms)",
                             db_size,
