@@ -102,7 +102,7 @@ The database uses a B-Tree structure with the following components:
 
 1. **Leaf Nodes**:
    - Store key-value pairs (Strings)
-   - Maximum 10 keys per leaf (configurable via `MAX_LEAF_KEYS`)
+   - Maximum 3 keys per leaf (configurable via `MAX_LEAF_KEYS`, reduced to support 1KB values)
    - When full, split into two nodes
 
 2. **Internal Nodes**:
@@ -136,6 +136,8 @@ Each node is serialized into a 4096-byte buffer:
 - **Magic Bytes**: File signature ensures database file integrity
 - **Interactive REPL**: User-friendly command-line interface with history support
 - **Data Safety**: All writes are synced to disk on exit
+- **Robust Deserialization**: Bounds checking prevents crashes from corrupted files
+- **Safe Page Allocation**: Page IDs derived from file size on reopen (no overwrites)
 - **Comprehensive Testing**: Integration tests verify correctness and persistence
 - **Performance Benchmarks**: Criterion-based benchmarks measure insertion performance at scale
 - **CI/CD**: Automated testing and code quality checks via GitHub Actions
@@ -144,7 +146,7 @@ Each node is serialized into a 4096-byte buffer:
 
 ### Leaf Node Splitting
 
-When a leaf node contains more than 10 key-value pairs:
+When a leaf node contains more than 3 key-value pairs (MAX_LEAF_KEYS):
 1. Split the pairs in half
 2. Create a new leaf node with the right half
 3. Update the original leaf with the left half
@@ -156,7 +158,8 @@ When a leaf node contains more than 10 key-value pairs:
 
 - The `Pager` struct manages all file I/O operations
 - Pages are read and written at 4KB boundaries
-- Each page write automatically calls `sync_all()` to ensure data durability
+- Page writes are flushed but not synced on every write for performance
+- `sync_all()` is called on `.exit` to ensure all data is persisted to disk
 - The pager uses `std::io::Seek` to jump to the correct file offset
 
 ## Development
@@ -167,6 +170,7 @@ The project includes comprehensive integration tests that verify:
 - Large-scale insertion (1000+ keys) triggering multiple node splits
 - Data persistence across database sessions
 - Root splitting and header updates
+- Insert-after-reopen correctness (prevents page overwrites)
 
 ```bash
 # Run all tests
@@ -237,9 +241,9 @@ The project includes a GitHub Actions workflow (`.github/workflows/ci.yml`) that
 $ cargo run
 B-Tree Database REPL
 Commands:
-  set [key] [value]  - Insert or update a key-value pair
-  get [key]         - Retrieve a value by key
-  .exit             - Exit and flush all data to disk
+  set <key> <value>  - Insert or update a key-value pair
+  get <key>          - Retrieve a value by key
+  .exit              - Exit and flush all data to disk
 
 btreedb> set user1 name1
 OK

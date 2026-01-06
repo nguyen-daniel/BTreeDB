@@ -127,11 +127,14 @@ impl BTree {
         match Self::read_header(&mut pager) {
             Ok(header) => {
                 // Existing database, use the root from header
-                // For simplicity, we'll estimate next_page_id (in a real implementation, this would be stored)
+                // Derive next_page_id from actual file size to prevent page overwrites
+                let page_count = pager.page_count()?;
+                let next_page_id = page_count.max(2); // At minimum, page 0 (header) and page 1 (root) exist
+
                 Ok(BTree {
                     pager,
                     root_page_id: header.root_page_id,
-                    next_page_id: header.root_page_id + 1, // Simplification
+                    next_page_id,
                 })
             }
             Err(_) => {

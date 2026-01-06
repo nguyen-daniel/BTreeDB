@@ -22,9 +22,9 @@ fn main() -> io::Result<()> {
 
     println!("B-Tree Database REPL");
     println!("Commands:");
-    println!("  set [key] [value]  - Insert or update a key-value pair");
-    println!("  get [key]         - Retrieve a value by key");
-    println!("  .exit             - Exit and flush all data to disk");
+    println!("  set <key> <value>  - Insert or update a key-value pair");
+    println!("  get <key>          - Retrieve a value by key");
+    println!("  .exit              - Exit and flush all data to disk");
     println!();
 
     loop {
@@ -50,7 +50,7 @@ fn main() -> io::Result<()> {
                 match parts[0] {
                     "set" => {
                         if parts.len() < 3 {
-                            println!("Error: Usage: set [key] [value]");
+                            println!("Error: Usage: set <key> <value>");
                             continue;
                         }
                         let key = parts[1];
@@ -63,7 +63,7 @@ fn main() -> io::Result<()> {
                     }
                     "get" => {
                         if parts.len() < 2 {
-                            println!("Error: Usage: get [key]");
+                            println!("Error: Usage: get <key>");
                             continue;
                         }
                         let key = parts[1];

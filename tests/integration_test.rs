@@ -28,7 +28,7 @@ fn test_large_scale_insertion() {
     let mut btree = BTree::new(pager).expect("Failed to create BTree");
 
     // Perform large-scale insertion (1000 keys) to trigger multiple B-Tree node splits
-    // With MAX_LEAF_KEYS = 10, we expect at least 100 leaf nodes, which will trigger
+    // With MAX_LEAF_KEYS = 3, we expect many leaf nodes, which will trigger
     // multiple splits and potentially create internal nodes and root splits
     const NUM_KEYS: usize = 1000;
 
@@ -179,7 +179,7 @@ fn test_root_splitting_persistence() {
     let db_path = temp_path.to_path_buf();
 
     // Insert enough keys to force root splitting
-    // With MAX_LEAF_KEYS = 10, inserting 11+ keys will cause the root to split
+    // With MAX_LEAF_KEYS = 3, inserting 4+ keys will cause the root to split
     {
         let pager = Pager::new(file);
         let mut btree = BTree::new(pager).expect("Failed to create BTree");
@@ -188,7 +188,7 @@ fn test_root_splitting_persistence() {
         println!("Initial root before splits: {}", initial_root);
 
         // Insert keys to trigger root split
-        // We need more than 10 keys to trigger a split, and then more to potentially
+        // We need more than 3 keys to trigger a split, and then more to potentially
         // cause the new internal root to also need updating
         for i in 0..50 {
             let key = format!("split_key_{:04}", i);
@@ -245,4 +245,130 @@ fn test_root_splitting_persistence() {
     }
 
     println!("Root splitting persistence test completed successfully");
+}
+
+#[test]
+fn test_inserts_after_reopen_no_page_overwrite() {
+    // This test verifies the fix for the next_page_id bug.
+    // Previously, next_page_id was estimated as root_page_id + 1 on reopen,
+    // which could cause page overwrites when the tree had grown beyond the root.
+    // Now, next_page_id is derived from the actual file size.
+
+    let (file, temp_path) = create_temp_db();
+    let db_path = temp_path.to_path_buf();
+
+    const KEYS_SESSION_1: usize = 500;
+    const KEYS_SESSION_2: usize = 500;
+
+    // First session: Insert many keys to create multiple pages/splits
+    {
+        let pager = Pager::new(file);
+        let mut btree = BTree::new(pager).expect("Failed to create BTree");
+
+        println!("Session 1: Inserting {} keys...", KEYS_SESSION_1);
+        for i in 0..KEYS_SESSION_1 {
+            let key = format!("session1_key_{:04}", i);
+            let value = format!("session1_value_{}", i);
+            btree
+                .insert(&key, &value)
+                .unwrap_or_else(|_| panic!("Failed to insert key {}", i));
+        }
+
+        // Verify all session 1 keys are present
+        for i in 0..KEYS_SESSION_1 {
+            let key = format!("session1_key_{:04}", i);
+            let expected = format!("session1_value_{}", i);
+            let result = btree.get(&key).expect("Failed to get key");
+            assert_eq!(result, Some(expected), "Session 1 key {} missing before close", i);
+        }
+
+        btree.sync().expect("Failed to sync");
+        drop(btree);
+    }
+
+    // Second session: Reopen and insert MORE keys
+    // This is where the bug would manifest - new pages would overwrite existing ones
+    {
+        let file = open_db_file(&db_path);
+        let pager = Pager::new(file);
+        let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
+
+        // First, verify session 1 keys are still accessible
+        println!("Session 2: Verifying {} keys from session 1...", KEYS_SESSION_1);
+        for i in 0..KEYS_SESSION_1 {
+            let key = format!("session1_key_{:04}", i);
+            let expected = format!("session1_value_{}", i);
+            let result = btree.get(&key).expect("Failed to get key");
+            assert_eq!(
+                result,
+                Some(expected),
+                "Session 1 key {} missing after reopen (before session 2 inserts)",
+                i
+            );
+        }
+
+        // Now insert more keys - this should NOT overwrite session 1 data
+        println!("Session 2: Inserting {} NEW keys...", KEYS_SESSION_2);
+        for i in 0..KEYS_SESSION_2 {
+            let key = format!("session2_key_{:04}", i);
+            let value = format!("session2_value_{}", i);
+            btree
+                .insert(&key, &value)
+                .unwrap_or_else(|_| panic!("Failed to insert session 2 key {}", i));
+        }
+
+        // Verify ALL keys (from both sessions) are present
+        println!("Session 2: Verifying all {} keys...", KEYS_SESSION_1 + KEYS_SESSION_2);
+
+        // Check session 1 keys are STILL present (this would fail with the old bug)
+        for i in 0..KEYS_SESSION_1 {
+            let key = format!("session1_key_{:04}", i);
+            let expected = format!("session1_value_{}", i);
+            let result = btree.get(&key).expect("Failed to get key");
+            assert_eq!(
+                result,
+                Some(expected),
+                "Session 1 key {} was OVERWRITTEN by session 2 inserts! next_page_id bug!",
+                i
+            );
+        }
+
+        // Check session 2 keys are present
+        for i in 0..KEYS_SESSION_2 {
+            let key = format!("session2_key_{:04}", i);
+            let expected = format!("session2_value_{}", i);
+            let result = btree.get(&key).expect("Failed to get key");
+            assert_eq!(result, Some(expected), "Session 2 key {} missing", i);
+        }
+
+        btree.sync().expect("Failed to sync");
+        drop(btree);
+    }
+
+    // Third session: Final verification that everything persisted correctly
+    {
+        let file = open_db_file(&db_path);
+        let pager = Pager::new(file);
+        let mut btree = BTree::new(pager).expect("Failed to re-open BTree for final check");
+
+        println!("Session 3: Final verification of all {} keys...", KEYS_SESSION_1 + KEYS_SESSION_2);
+
+        for i in 0..KEYS_SESSION_1 {
+            let key = format!("session1_key_{:04}", i);
+            let expected = format!("session1_value_{}", i);
+            let result = btree.get(&key).expect("Failed to get key");
+            assert_eq!(result, Some(expected), "Session 1 key {} missing in final check", i);
+        }
+
+        for i in 0..KEYS_SESSION_2 {
+            let key = format!("session2_key_{:04}", i);
+            let expected = format!("session2_value_{}", i);
+            let result = btree.get(&key).expect("Failed to get key");
+            assert_eq!(result, Some(expected), "Session 2 key {} missing in final check", i);
+        }
+
+        drop(btree);
+    }
+
+    println!("Insert-after-reopen test completed successfully - no page overwrites!");
 }

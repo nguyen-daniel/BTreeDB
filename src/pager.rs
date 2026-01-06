@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Page size in bytes (4KB)
-const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = 4096;
 
 /// Pager manages file I/O for a persistent B-Tree database.
 /// It handles reading and writing fixed-size pages to/from disk.
@@ -20,6 +20,19 @@ impl Pager {
     /// This is useful for syncing all data to disk.
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
+    }
+
+    /// Returns the total number of pages in the file.
+    /// Calculated as file_size / PAGE_SIZE, rounded up.
+    /// Returns 0 for empty files.
+    pub fn page_count(&mut self) -> std::io::Result<u32> {
+        let file_len = self.file.seek(SeekFrom::End(0))?;
+        if file_len == 0 {
+            Ok(0)
+        } else {
+            // Round up to account for partially written pages
+            Ok(file_len.div_ceil(PAGE_SIZE as u64) as u32)
+        }
     }
 
     /// Reads a page from the file at the given page_id.

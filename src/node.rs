@@ -4,6 +4,18 @@ use std::io::{Read, Write};
 /// Page size in bytes (4KB)
 pub const PAGE_SIZE: usize = 4096;
 
+/// Maximum allowed key length (prevents OOM from corrupted data)
+/// Set to PAGE_SIZE - header overhead to be safe
+const MAX_KEY_LEN: u32 = PAGE_SIZE as u32 - 16;
+
+/// Maximum allowed value length (prevents OOM from corrupted data)
+const MAX_VALUE_LEN: u32 = PAGE_SIZE as u32 - 16;
+
+/// Maximum number of keys per node (prevents excessive allocations)
+/// Internal nodes: MAX_INTERNAL_KEYS = 10, Leaf nodes: MAX_LEAF_KEYS = 3
+/// We use a generous limit here for validation
+const MAX_NUM_KEYS: u32 = 1000;
+
 /// Node type identifier
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +175,7 @@ impl Node {
     }
 
     /// Deserializes a node from a 4096-byte buffer.
+    /// Includes bounds checking to prevent OOM attacks from corrupted data.
     pub fn deserialize(buffer: &[u8; PAGE_SIZE]) -> Result<Self, std::io::Error> {
         let mut cursor = std::io::Cursor::new(buffer);
 
@@ -182,30 +195,87 @@ impl Node {
         // Read num_keys (bytes 1-4)
         let num_keys = cursor.read_u32::<LittleEndian>()?;
 
+        // Validate num_keys to prevent excessive allocations
+        if num_keys > MAX_NUM_KEYS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "num_keys ({}) exceeds maximum allowed ({})",
+                    num_keys, MAX_NUM_KEYS
+                ),
+            ));
+        }
+
         match node_type {
             NodeType::Leaf => {
-                let mut pairs = Vec::new();
+                let mut pairs = Vec::with_capacity(num_keys as usize);
 
-                for _ in 0..num_keys {
-                    // Read key
+                for i in 0..num_keys {
+                    // Read key length and validate
                     let key_len = cursor.read_u32::<LittleEndian>()?;
+                    if key_len > MAX_KEY_LEN {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Key {} length ({}) exceeds maximum allowed ({})",
+                                i, key_len, MAX_KEY_LEN
+                            ),
+                        ));
+                    }
+
+                    // Check if key would read past buffer
+                    if cursor.position() as usize + key_len as usize > PAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Key {} read would exceed page boundary (pos: {}, len: {})",
+                                i,
+                                cursor.position(),
+                                key_len
+                            ),
+                        ));
+                    }
+
                     let mut key_bytes = vec![0u8; key_len as usize];
                     cursor.read_exact(&mut key_bytes)?;
                     let key = String::from_utf8(key_bytes).map_err(|e| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Invalid UTF-8 in key: {}", e),
+                            format!("Invalid UTF-8 in key {}: {}", i, e),
                         )
                     })?;
 
-                    // Read value
+                    // Read value length and validate
                     let value_len = cursor.read_u32::<LittleEndian>()?;
+                    if value_len > MAX_VALUE_LEN {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Value {} length ({}) exceeds maximum allowed ({})",
+                                i, value_len, MAX_VALUE_LEN
+                            ),
+                        ));
+                    }
+
+                    // Check if value would read past buffer
+                    if cursor.position() as usize + value_len as usize > PAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Value {} read would exceed page boundary (pos: {}, len: {})",
+                                i,
+                                cursor.position(),
+                                value_len
+                            ),
+                        ));
+                    }
+
                     let mut value_bytes = vec![0u8; value_len as usize];
                     cursor.read_exact(&mut value_bytes)?;
                     let value = String::from_utf8(value_bytes).map_err(|e| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Invalid UTF-8 in value: {}", e),
+                            format!("Invalid UTF-8 in value {}: {}", i, e),
                         )
                     })?;
 
@@ -219,25 +289,62 @@ impl Node {
                 })
             }
             NodeType::Internal => {
-                let mut keys = Vec::new();
-                let mut children = Vec::new();
+                let mut keys = Vec::with_capacity(num_keys as usize);
+                let mut children = Vec::with_capacity(num_keys as usize + 1);
 
                 // Read keys
-                for _ in 0..num_keys {
+                for i in 0..num_keys {
                     let key_len = cursor.read_u32::<LittleEndian>()?;
+                    if key_len > MAX_KEY_LEN {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Internal key {} length ({}) exceeds maximum allowed ({})",
+                                i, key_len, MAX_KEY_LEN
+                            ),
+                        ));
+                    }
+
+                    // Check if key would read past buffer
+                    if cursor.position() as usize + key_len as usize > PAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Internal key {} read would exceed page boundary (pos: {}, len: {})",
+                                i,
+                                cursor.position(),
+                                key_len
+                            ),
+                        ));
+                    }
+
                     let mut key_bytes = vec![0u8; key_len as usize];
                     cursor.read_exact(&mut key_bytes)?;
                     let key = String::from_utf8(key_bytes).map_err(|e| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Invalid UTF-8 in key: {}", e),
+                            format!("Invalid UTF-8 in internal key {}: {}", i, e),
                         )
                     })?;
                     keys.push(key);
                 }
 
                 // Read children (num_keys + 1 children)
-                for _ in 0..=num_keys {
+                let num_children = num_keys + 1;
+                let children_size = num_children as usize * 4;
+                if cursor.position() as usize + children_size > PAGE_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Children read would exceed page boundary (pos: {}, need: {} bytes for {} children)",
+                            cursor.position(),
+                            children_size,
+                            num_children
+                        ),
+                    ));
+                }
+
+                for _ in 0..num_children {
                     let child_id = cursor.read_u32::<LittleEndian>()?;
                     children.push(child_id);
                 }
