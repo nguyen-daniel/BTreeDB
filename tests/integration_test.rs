@@ -396,3 +396,199 @@ fn test_inserts_after_reopen_no_page_overwrite() {
 
     println!("Insert-after-reopen test completed successfully - no page overwrites!");
 }
+
+#[test]
+fn test_delete_single_key() {
+    let (file, _temp_path) = create_temp_db();
+    let pager = Pager::new(file);
+    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+
+    // Insert a key
+    btree.insert("key1", "value1").expect("Failed to insert");
+
+    // Verify it exists
+    assert_eq!(btree.get("key1").unwrap(), Some("value1".to_string()));
+
+    // Delete it
+    let deleted = btree.delete("key1").expect("Failed to delete");
+    assert!(deleted, "Key should have been deleted");
+
+    // Verify it's gone
+    assert_eq!(btree.get("key1").unwrap(), None);
+
+    // Try to delete again - should return false
+    let deleted_again = btree.delete("key1").expect("Failed to delete again");
+    assert!(!deleted_again, "Key should not exist to delete");
+
+    println!("Single key deletion test completed successfully");
+}
+
+#[test]
+fn test_delete_multiple_keys() {
+    let (file, _temp_path) = create_temp_db();
+    let pager = Pager::new(file);
+    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+
+    // Insert multiple keys
+    const NUM_KEYS: usize = 20;
+    for i in 0..NUM_KEYS {
+        let key = format!("key_{:04}", i);
+        let value = format!("value_{}", i);
+        btree.insert(&key, &value).expect("Failed to insert");
+    }
+
+    // Delete every other key
+    for i in (0..NUM_KEYS).step_by(2) {
+        let key = format!("key_{:04}", i);
+        let deleted = btree.delete(&key).expect("Failed to delete");
+        assert!(deleted, "Key {} should have been deleted", key);
+    }
+
+    // Verify deleted keys are gone and remaining keys still exist
+    for i in 0..NUM_KEYS {
+        let key = format!("key_{:04}", i);
+        let result = btree.get(&key).expect("Failed to get");
+        if i % 2 == 0 {
+            assert_eq!(result, None, "Deleted key {} should be gone", key);
+        } else {
+            let expected = format!("value_{}", i);
+            assert_eq!(result, Some(expected), "Key {} should still exist", key);
+        }
+    }
+
+    println!("Multiple key deletion test completed successfully");
+}
+
+#[test]
+fn test_delete_all_keys() {
+    let (file, _temp_path) = create_temp_db();
+    let pager = Pager::new(file);
+    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+
+    // Insert keys
+    const NUM_KEYS: usize = 50;
+    for i in 0..NUM_KEYS {
+        let key = format!("key_{:04}", i);
+        let value = format!("value_{}", i);
+        btree.insert(&key, &value).expect("Failed to insert");
+    }
+
+    // Delete all keys
+    for i in 0..NUM_KEYS {
+        let key = format!("key_{:04}", i);
+        let deleted = btree.delete(&key).expect("Failed to delete");
+        assert!(deleted, "Key {} should have been deleted", key);
+    }
+
+    // Verify all keys are gone
+    for i in 0..NUM_KEYS {
+        let key = format!("key_{:04}", i);
+        let result = btree.get(&key).expect("Failed to get");
+        assert_eq!(result, None, "Key {} should be gone", key);
+    }
+
+    // Insert new keys after deletion
+    for i in 0..10 {
+        let key = format!("new_key_{}", i);
+        let value = format!("new_value_{}", i);
+        btree
+            .insert(&key, &value)
+            .expect("Failed to insert new key");
+    }
+
+    // Verify new keys exist
+    for i in 0..10 {
+        let key = format!("new_key_{}", i);
+        let expected = format!("new_value_{}", i);
+        let result = btree.get(&key).expect("Failed to get new key");
+        assert_eq!(result, Some(expected), "New key {} should exist", key);
+    }
+
+    println!("Delete all keys test completed successfully");
+}
+
+#[test]
+fn test_delete_persistence() {
+    let (file, temp_path) = create_temp_db();
+    let db_path = temp_path.to_path_buf();
+
+    // First session: Insert and delete some keys
+    {
+        let pager = Pager::new(file);
+        let mut btree = BTree::new(pager).expect("Failed to create BTree");
+
+        // Insert 20 keys
+        for i in 0..20 {
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{}", i);
+            btree.insert(&key, &value).expect("Failed to insert");
+        }
+
+        // Delete keys 0-9
+        for i in 0..10 {
+            let key = format!("key_{:04}", i);
+            btree.delete(&key).expect("Failed to delete");
+        }
+
+        btree.sync().expect("Failed to sync");
+        drop(btree);
+    }
+
+    // Second session: Verify deletions persisted
+    {
+        let file = open_db_file(&db_path);
+        let pager = Pager::new(file);
+        let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
+
+        // Keys 0-9 should be gone
+        for i in 0..10 {
+            let key = format!("key_{:04}", i);
+            let result = btree.get(&key).expect("Failed to get");
+            assert_eq!(
+                result, None,
+                "Deleted key {} should persist as deleted",
+                key
+            );
+        }
+
+        // Keys 10-19 should still exist
+        for i in 10..20 {
+            let key = format!("key_{:04}", i);
+            let expected = format!("value_{}", i);
+            let result = btree.get(&key).expect("Failed to get");
+            assert_eq!(result, Some(expected), "Key {} should persist", key);
+        }
+
+        drop(btree);
+    }
+
+    println!("Delete persistence test completed successfully");
+}
+
+#[test]
+fn test_delete_and_reinsert() {
+    let (file, _temp_path) = create_temp_db();
+    let pager = Pager::new(file);
+    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+
+    // Insert a key
+    btree
+        .insert("key1", "original_value")
+        .expect("Failed to insert");
+    assert_eq!(
+        btree.get("key1").unwrap(),
+        Some("original_value".to_string())
+    );
+
+    // Delete the key
+    btree.delete("key1").expect("Failed to delete");
+    assert_eq!(btree.get("key1").unwrap(), None);
+
+    // Reinsert with different value
+    btree
+        .insert("key1", "new_value")
+        .expect("Failed to reinsert");
+    assert_eq!(btree.get("key1").unwrap(), Some("new_value".to_string()));
+
+    println!("Delete and reinsert test completed successfully");
+}

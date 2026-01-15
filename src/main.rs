@@ -1,4 +1,5 @@
 use btreedb::btree::BTree;
+use btreedb::cursor::Cursor;
 use rustyline::DefaultEditor;
 use std::fs::OpenOptions;
 use std::io;
@@ -24,6 +25,10 @@ fn main() -> io::Result<()> {
     println!("Commands:");
     println!("  set <key> <value>  - Insert or update a key-value pair");
     println!("  get <key>          - Retrieve a value by key");
+    println!("  delete <key>       - Delete a key-value pair");
+    println!("  scan [start] [end] - Scan keys in range [start, end)");
+    println!("  .stats             - Show database statistics");
+    println!("  .dump              - Dump tree structure");
     println!("  .exit              - Exit and flush all data to disk");
     println!();
 
@@ -36,9 +41,35 @@ fn main() -> io::Result<()> {
                     continue;
                 }
 
-                // Handle .exit command
+                // Handle dot commands
                 if line == ".exit" {
                     break;
+                }
+
+                if line == ".stats" {
+                    match btree.stats() {
+                        Ok(stats) => {
+                            println!("Database Statistics:");
+                            println!("  Keys:           {}", stats.key_count);
+                            println!("  Tree Height:    {}", stats.tree_height);
+                            println!("  Total Pages:    {}", stats.page_count);
+                            println!("  Leaf Nodes:     {}", stats.leaf_count);
+                            println!("  Internal Nodes: {}", stats.internal_count);
+                        }
+                        Err(e) => println!("Error: {}", e),
+                    }
+                    continue;
+                }
+
+                if line == ".dump" {
+                    match btree.dump_tree() {
+                        Ok(output) => {
+                            println!("Tree Structure:");
+                            print!("{}", output);
+                        }
+                        Err(e) => println!("Error: {}", e),
+                    }
+                    continue;
                 }
 
                 // Parse the command
@@ -74,9 +105,42 @@ fn main() -> io::Result<()> {
                             Err(e) => println!("Error: {}", e),
                         }
                     }
+                    "delete" => {
+                        if parts.len() < 2 {
+                            println!("Error: Usage: delete <key>");
+                            continue;
+                        }
+                        let key = parts[1];
+
+                        match btree.delete(key) {
+                            Ok(true) => println!("OK"),
+                            Ok(false) => println!("(nil)"),
+                            Err(e) => println!("Error: {}", e),
+                        }
+                    }
+                    "scan" => {
+                        // Parse optional start and end keys
+                        let start_key = parts.get(1).copied();
+                        let end_key = parts.get(2).copied();
+
+                        match Cursor::scan_range(&mut btree, start_key, end_key) {
+                            Ok(results) => {
+                                if results.is_empty() {
+                                    println!("(empty)");
+                                } else {
+                                    let count = results.len();
+                                    for (key, value) in results {
+                                        println!("{} -> {}", key, value);
+                                    }
+                                    println!("({} results)", count);
+                                }
+                            }
+                            Err(e) => println!("Error: {}", e),
+                        }
+                    }
                     _ => {
                         println!(
-                            "Unknown command: {}. Use 'set', 'get', or '.exit'",
+                            "Unknown command: {}. Use 'set', 'get', 'delete', 'scan', or '.exit'",
                             parts[0]
                         );
                     }

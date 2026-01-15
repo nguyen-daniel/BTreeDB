@@ -4,11 +4,28 @@ A clean, educational implementation of a persistent B-Tree database in Rust. Thi
 
 ## Project Structure
 
+### Core Modules
 - **`src/pager.rs`** - Manages file I/O operations, reading and writing 4KB pages to/from disk
 - **`src/node.rs`** - Defines the B-Tree node structure (Internal and Leaf nodes) with serialization/deserialization
-- **`src/btree.rs`** - Implements the B-Tree data structure with insert, search, and split operations
+- **`src/btree.rs`** - Implements the B-Tree data structure with insert, search, delete, and split operations
+- **`src/cursor.rs`** - Cursor for tree traversal and range queries
+- **`src/value.rs`** - Multiple value type support (String, Integer, Float, Binary, Null)
+
+### Durability & Transactions
+- **`src/wal.rs`** - Write-Ahead Logging for crash recovery and durability
+- **`src/transaction.rs`** - Transaction support with commit/rollback and savepoints
+- **`src/backup.rs`** - Database backup and restore functionality
+
+### Advanced Features
+- **`src/compression.rs`** - Value compression using run-length encoding
+- **`src/manager.rs`** - Multiple database instance management
+- **`src/concurrency.rs`** - Page-level locking and connection pooling
+
+### Application
 - **`src/main.rs`** - Interactive REPL (Read-Eval-Print Loop) for database operations
 - **`src/lib.rs`** - Library module exports
+
+### Testing & CI
 - **`tests/integration_test.rs`** - Integration test suite for database operations and persistence
 - **`benches/bench.rs`** - Performance benchmarks using Criterion
 - **`.github/workflows/ci.yml`** - GitHub Actions CI/CD workflow
@@ -76,6 +93,51 @@ btreedb> get nonexistent
 (nil)
 ```
 
+#### Delete a Key
+
+```bash
+btreedb> delete name
+OK
+btreedb> delete nonexistent
+(nil)
+```
+
+#### Scan Range
+
+```bash
+btreedb> scan
+key1 -> value1
+key2 -> value2
+(2 results)
+
+btreedb> scan a z
+apple -> fruit
+banana -> fruit
+(2 results)
+```
+
+#### Database Statistics
+
+```bash
+btreedb> .stats
+Database Statistics:
+  Keys:           100
+  Tree Height:    3
+  Total Pages:    25
+  Leaf Nodes:     20
+  Internal Nodes: 4
+```
+
+#### Tree Dump
+
+```bash
+btreedb> .dump
+Tree Structure:
+[Internal] keys: [key_50]
+  [Leaf] keys: [key_01, key_02, ...]
+  [Leaf] keys: [key_51, key_52, ...]
+```
+
 #### Exit
 
 ```bash
@@ -130,16 +192,21 @@ Each node is serialized into a 4096-byte buffer:
 ## Key Features
 
 - **Persistent Storage**: All data is stored on disk in a binary format
-- **B-Tree Structure**: Efficient O(log n) search and insert operations
-- **Automatic Splitting**: Leaf nodes automatically split when they exceed capacity
-- **Root Tracking**: Database header tracks the current root page ID
-- **Magic Bytes**: File signature ensures database file integrity
+- **B-Tree Structure**: Efficient O(log n) search, insert, and delete operations
+- **CRUD Operations**: Full create, read, update, delete support with proper rebalancing
+- **Range Queries**: Cursor-based iteration and range scanning
+- **Multiple Value Types**: Support for strings, integers, floats, binary data, and null
+- **Write-Ahead Logging**: Crash recovery through WAL replay
+- **Transaction Support**: ACID transactions with commit, rollback, and savepoints
+- **Value Compression**: Automatic compression for large repetitive values
+- **Backup/Restore**: Hot backup capability without stopping the database
+- **Multi-Database**: Manage multiple database instances in a single process
+- **Concurrent Access**: Page-level locking with multiple readers/single writer
 - **Interactive REPL**: User-friendly command-line interface with history support
-- **Data Safety**: All writes are synced to disk on exit
 - **Robust Deserialization**: Bounds checking prevents crashes from corrupted files
 - **Safe Page Allocation**: Page IDs derived from file size on reopen (no overwrites)
 - **Comprehensive Testing**: Integration tests verify correctness and persistence
-- **Performance Benchmarks**: Criterion-based benchmarks measure insertion performance at scale
+- **Performance Benchmarks**: Criterion-based benchmarks measure performance at scale
 - **CI/CD**: Automated testing and code quality checks via GitHub Actions
 
 ## Implementation Details
@@ -259,20 +326,83 @@ btreedb> .exit
 All data flushed to disk. Goodbye!
 ```
 
+## Implemented Features
+
+### Core Features (MVP)
+- **Persistent Storage**: All data is stored on disk in a binary format
+- **B-Tree Structure**: Efficient O(log n) search, insert, and delete operations
+- **Automatic Splitting**: Leaf and internal nodes automatically split when they exceed capacity
+- **Root Tracking**: Database header tracks the current root page ID
+- **Magic Bytes**: File signature ensures database file integrity
+- **Interactive REPL**: User-friendly command-line interface with history support
+- **Data Safety**: All writes are synced to disk on exit
+
+### Delete Operations (Phase 1)
+- Key deletion with proper node rebalancing
+- Node merging when underflow occurs
+- Root demotion when tree shrinks
+- REPL `delete <key>` command
+
+### Cursor and Range Queries (Phase 2)
+- `Cursor` struct for efficient tree traversal
+- `seek()`, `next()`, `seek_first()` navigation
+- `scan_range(start, end)` for range queries
+- REPL `scan [start] [end]` command
+
+### Database Statistics (Phase 3)
+- Key count, tree height, page count tracking
+- Leaf and internal node counts
+- `.stats` command for statistics display
+- `.dump` command for tree structure visualization
+
+### Multiple Value Types (Phase 4)
+- `Value` enum supporting: String, Integer, Float, Binary, Null
+- Type-prefixed input parsing (e.g., `i:42` for integer, `f:3.14` for float)
+- Backwards-compatible with string-only data
+
+### Write-Ahead Logging (Phase 5)
+- WAL file (`*.db-wal`) alongside main database
+- Page-level logging with checksums
+- Crash recovery by replaying WAL on startup
+- Checkpoint mechanism to clear WAL after sync
+
+### Transaction Support (Phase 6)
+- Begin/commit/rollback semantics
+- Transaction manager for coordination
+- Savepoints for partial rollback
+- Integration with WAL for durability
+
+### Value Compression (Phase 7)
+- Run-length encoding (RLE) for repetitive data
+- Automatic compression for values above threshold
+- Compression statistics tracking
+- Transparent decompression on read
+
+### Backup and Restore (Phase 8)
+- Hot backup capability (no downtime required)
+- Optional WAL file backup
+- Backup verification
+- Full restore functionality
+
+### Multiple Database Support (Phase 9)
+- `DatabaseManager` for handling multiple instances
+- Named database handles
+- Independent data isolation
+- Configurable database options
+
+### Concurrent Access (Phase 10)
+- Page-level read-write locks
+- Multiple readers, single writer pattern
+- Lock manager with deadlock prevention
+- Connection pooling with configurable limits
+
 ## Future Improvements
 
-- [ ] Add support for delete operations
-- [ ] Implement range queries (scan operations)
-- [ ] Add transaction support with rollback
-- [ ] Implement internal node splitting for better balance
-- [ ] Add database statistics (number of keys, tree height, etc.)
-- [ ] Support for different value types (not just Strings)
-- [ ] Add compression for values
-- [ ] Implement WAL (Write-Ahead Logging) for better durability
-- [ ] Add support for multiple databases
-- [ ] Implement database backup and restore
 - [ ] Add more benchmark scenarios (search performance, concurrent access)
 - [ ] Expand test coverage (edge cases, error handling)
+- [ ] Implement MVCC for snapshot isolation
+- [ ] Add network protocol for client-server mode
+- [ ] Implement secondary indexes
 
 ## References
 

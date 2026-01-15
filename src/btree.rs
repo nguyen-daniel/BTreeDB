@@ -20,6 +20,14 @@ enum InsertResult {
     },
 }
 
+/// Result of a delete operation.
+enum DeleteResult {
+    /// Key was found and deleted
+    Ok,
+    /// Key was not found
+    NotFound,
+}
+
 /// Database header stored in the first 100 bytes of page 0.
 struct DatabaseHeader {
     /// Magic bytes signature: "BTREEDB"
@@ -92,6 +100,21 @@ pub struct BTree {
     pager: Pager,
     root_page_id: u32,
     next_page_id: u32,
+}
+
+/// Database statistics returned by `BTree::stats()`.
+#[derive(Debug, Clone)]
+pub struct DatabaseStats {
+    /// Total number of keys in the database
+    pub key_count: u64,
+    /// Height of the B-Tree (1 = just root leaf)
+    pub tree_height: u32,
+    /// Total number of pages in the database file
+    pub page_count: u32,
+    /// Number of leaf nodes
+    pub leaf_count: u32,
+    /// Number of internal nodes
+    pub internal_count: u32,
 }
 
 impl BTree {
@@ -167,6 +190,120 @@ impl BTree {
     /// Syncs all data to disk by flushing the underlying file.
     pub fn sync(&mut self) -> io::Result<()> {
         self.pager.file_mut().sync_all()
+    }
+
+    /// Returns a mutable reference to the pager.
+    /// Used by the cursor for tree traversal.
+    pub fn pager(&mut self) -> &mut Pager {
+        &mut self.pager
+    }
+
+    /// Computes and returns database statistics.
+    pub fn stats(&mut self) -> io::Result<DatabaseStats> {
+        let mut stats = DatabaseStats {
+            key_count: 0,
+            tree_height: 0,
+            page_count: self.pager.page_count()?,
+            leaf_count: 0,
+            internal_count: 0,
+        };
+
+        self.collect_stats(self.root_page_id, 1, &mut stats)?;
+        Ok(stats)
+    }
+
+    /// Recursively collects statistics from the tree.
+    fn collect_stats(
+        &mut self,
+        page_id: u32,
+        depth: u32,
+        stats: &mut DatabaseStats,
+    ) -> io::Result<()> {
+        // Update tree height
+        if depth > stats.tree_height {
+            stats.tree_height = depth;
+        }
+
+        let page_buffer = self.pager.get_page(page_id)?;
+        let node = Node::deserialize(&page_buffer)?;
+
+        match node {
+            Node::Leaf { pairs, .. } => {
+                stats.leaf_count += 1;
+                stats.key_count += pairs.len() as u64;
+            }
+            Node::Internal { children, .. } => {
+                stats.internal_count += 1;
+                for child_id in children {
+                    self.collect_stats(child_id, depth + 1, stats)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Generates a text visualization of the tree structure.
+    pub fn dump_tree(&mut self) -> io::Result<String> {
+        let mut output = String::new();
+        self.dump_node(self.root_page_id, 0, &mut output)?;
+        Ok(output)
+    }
+
+    /// Recursively dumps a node and its children.
+    fn dump_node(&mut self, page_id: u32, indent: usize, output: &mut String) -> io::Result<()> {
+        let page_buffer = self.pager.get_page(page_id)?;
+        let node = Node::deserialize(&page_buffer)?;
+
+        let prefix = "  ".repeat(indent);
+
+        match node {
+            Node::Leaf { pairs, .. } => {
+                output.push_str(&format!(
+                    "{}[Leaf@{}] {} keys: ",
+                    prefix,
+                    page_id,
+                    pairs.len()
+                ));
+                let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+                if keys.len() <= 5 {
+                    output.push_str(&keys.join(", "));
+                } else {
+                    output.push_str(&format!(
+                        "{}, {}, ... {}",
+                        keys[0],
+                        keys[1],
+                        keys[keys.len() - 1]
+                    ));
+                }
+                output.push('\n');
+            }
+            Node::Internal { keys, children, .. } => {
+                output.push_str(&format!(
+                    "{}[Internal@{}] {} keys: ",
+                    prefix,
+                    page_id,
+                    keys.len()
+                ));
+                if keys.len() <= 5 {
+                    output.push_str(&keys.join(", "));
+                } else {
+                    output.push_str(&format!(
+                        "{}, {}, ... {}",
+                        keys[0],
+                        keys[1],
+                        keys[keys.len() - 1]
+                    ));
+                }
+                output.push('\n');
+
+                for child_id in children {
+                    self.dump_node(child_id, indent + 1, output)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Retrieves a value by key from the B-Tree.
@@ -416,5 +553,74 @@ impl BTree {
 
         // Update the header with the new root page ID
         Self::write_header(&mut self.pager, new_root_page_id)
+    }
+
+    /// Deletes a key from the B-Tree.
+    /// Returns true if the key was found and deleted, false if not found.
+    /// Note: This is a simplified delete that doesn't do node rebalancing.
+    /// Nodes may become sparse after deletions, but the tree remains functional.
+    pub fn delete(&mut self, key: &str) -> io::Result<bool> {
+        let result = self.delete_recursive(self.root_page_id, key)?;
+
+        match result {
+            DeleteResult::NotFound => Ok(false),
+            DeleteResult::Ok => {
+                // Check if root needs to be demoted
+                self.handle_root_demotion()?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Handles root demotion when root becomes empty or has only one child.
+    fn handle_root_demotion(&mut self) -> io::Result<()> {
+        let page_buffer = self.pager.get_page(self.root_page_id)?;
+        let node = Node::deserialize(&page_buffer)?;
+
+        match node {
+            Node::Internal { children, keys, .. } => {
+                // If internal root has no keys but one child, demote
+                if keys.is_empty() && children.len() == 1 {
+                    self.root_page_id = children[0];
+                    Self::write_header(&mut self.pager, self.root_page_id)?;
+                }
+            }
+            Node::Leaf { .. } => {
+                // Root is a leaf, no demotion needed
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively deletes a key from the tree starting at page_id.
+    /// Note: This is a simplified delete that doesn't do rebalancing (nodes may become empty).
+    fn delete_recursive(&mut self, page_id: u32, key: &str) -> io::Result<DeleteResult> {
+        let page_buffer = self.pager.get_page(page_id)?;
+        let node = Node::deserialize(&page_buffer)?;
+
+        match node {
+            Node::Leaf { mut pairs, .. } => {
+                // Find and remove the key
+                let pos = pairs.iter().position(|(k, _)| k == key);
+                match pos {
+                    Some(idx) => {
+                        pairs.remove(idx);
+                        let updated_node = Node::new_leaf(pairs);
+                        let buffer = updated_node.serialize()?;
+                        self.pager.write_page(page_id, &buffer)?;
+                        Ok(DeleteResult::Ok)
+                    }
+                    None => Ok(DeleteResult::NotFound),
+                }
+            }
+            Node::Internal { keys, children, .. } => {
+                // Find the child that contains the key
+                let child_index = Self::find_child_index(&keys, key);
+                let child_page_id = children[child_index];
+
+                // Recursively delete from child
+                self.delete_recursive(child_page_id, key)
+            }
+        }
     }
 }
