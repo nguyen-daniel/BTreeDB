@@ -1,0 +1,11 @@
+{
+  "n_keys": 1000,
+  "btree_bytes": 2457600,
+  "wal_bytes_after_checkpoint": 32,
+  "jsonl_bytes": 32890,
+  "btree_write_ms": 1606.727,
+  "jsonl_write_ms": 11.723,
+  "btree_over_jsonl_size": 74.7218,
+  "size_reduction_vs_jsonl": -73.7218,
+  "note": "Fair comparison: same 1000 string KV pairs. B-tree uses 4KB pages (internal fragmentation). JSONL is a naive dump, not a database."
+}
