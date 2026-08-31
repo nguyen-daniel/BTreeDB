@@ -108,8 +108,12 @@ impl DatabaseManager {
             ));
         }
 
-        let file = open_database_file(&config)?;
-        let pager = Pager::new(file);
+        let pager = if config.read_only {
+            let file = open_database_file(&config)?;
+            Pager::new(file)
+        } else {
+            Pager::open(&config.path)?
+        };
         let btree = BTree::new(pager)?;
 
         self.databases.insert(

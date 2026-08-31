@@ -592,3 +592,112 @@ fn test_delete_and_reinsert() {
 
     println!("Delete and reinsert test completed successfully");
 }
+
+#[test]
+fn test_1000_keys_persistence_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("keys1000.db");
+
+    {
+        let mut btree = BTree::open(&db_path).expect("open");
+        for i in 0..1000 {
+            btree
+                .insert(&format!("key_{:04}", i), &format!("value_{}", i))
+                .expect("insert");
+        }
+        let stats = btree.stats().expect("stats");
+        assert_eq!(stats.key_count, 1000);
+        assert!(
+            stats.tree_height >= 2,
+            "expected node splits, height={}",
+            stats.tree_height
+        );
+        assert!(stats.leaf_count > 1, "expected multiple leaves after splits");
+        btree.sync().expect("sync");
+    }
+
+    {
+        let mut btree = BTree::open(&db_path).expect("reopen");
+        let stats = btree.stats().expect("stats");
+        assert_eq!(stats.key_count, 1000);
+        assert!(stats.tree_height >= 2);
+        for i in 0..1000 {
+            let key = format!("key_{:04}", i);
+            assert_eq!(
+                btree.get(&key).expect("get"),
+                Some(format!("value_{}", i)),
+                "missing {key} after reopen"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_range_scan_after_splits() {
+    use btreedb::cursor::Cursor;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("scan.db");
+    let mut btree = BTree::open(&db_path).expect("open");
+    for i in 0..80 {
+        btree
+            .insert(&format!("k{:03}", i), &format!("v{i}"))
+            .expect("insert");
+    }
+    let rows = Cursor::scan_range(&mut btree, Some("k010"), Some("k020")).expect("scan");
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0].0, "k010");
+    assert_eq!(rows[9].0, "k019");
+    let all = Cursor::scan_range(&mut btree, None, None).expect("scan all");
+    assert_eq!(all.len(), 80);
+}
+
+#[test]
+fn test_wal_recovers_zeroed_page() {
+    use btreedb::pager::{Pager, PAGE_SIZE};
+    use btreedb::wal::WAL;
+    use std::fs::OpenOptions;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("crash.db");
+
+    {
+        let mut btree = BTree::open(&db_path).expect("open");
+        btree.insert("alpha", "one").expect("insert");
+        btree.sync().expect("sync");
+    }
+
+    let original = {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("open db");
+        let mut pager = Pager::new(file);
+        pager.get_page(1).expect("read leaf")
+    };
+
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("open db");
+        let mut pager = Pager::new(file);
+        pager
+            .write_page(1, &[0u8; PAGE_SIZE])
+            .expect("zero leaf (no WAL)");
+    }
+
+    {
+        let mut wal = WAL::open(&db_path).expect("wal");
+        wal.log_page(1, &original).expect("log original leaf");
+    }
+
+    let mut btree = BTree::open(&db_path).expect("recover");
+    assert_eq!(
+        btree.get("alpha").expect("get"),
+        Some("one".to_string()),
+        "WAL replay should restore the leaf"
+    );
+}

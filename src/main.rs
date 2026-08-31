@@ -1,21 +1,11 @@
 use btreedb::btree::BTree;
 use btreedb::cursor::Cursor;
 use rustyline::DefaultEditor;
-use std::fs::OpenOptions;
 use std::io;
 
 fn main() -> io::Result<()> {
-    // Open or create the database file
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open("btree.db")?;
-
-    // Create the pager and BTree
-    let pager = btreedb::pager::Pager::new(file);
-    let mut btree = BTree::new(pager)?;
+    // Recover WAL then attach it to the write path
+    let mut btree = BTree::open("btree.db")?;
 
     // Create the REPL editor
     let mut rl = DefaultEditor::new()
