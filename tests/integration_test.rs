@@ -612,7 +612,10 @@ fn test_1000_keys_persistence_reopen() {
             "expected node splits, height={}",
             stats.tree_height
         );
-        assert!(stats.leaf_count > 1, "expected multiple leaves after splits");
+        assert!(
+            stats.leaf_count > 1,
+            "expected multiple leaves after splits"
+        );
         btree.sync().expect("sync");
     }
 
@@ -699,5 +702,33 @@ fn test_wal_recovers_zeroed_page() {
         btree.get("alpha").expect("get"),
         Some("one".to_string()),
         "WAL replay should restore the leaf"
+    );
+}
+
+#[test]
+fn test_wrong_magic_fails_open() {
+    use btreedb::pager::PAGE_SIZE;
+    use std::io::ErrorKind;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("bad_magic.db");
+
+    let mut page = vec![0u8; PAGE_SIZE];
+    page[..7].copy_from_slice(b"NOTBTRE");
+    std::fs::write(&db_path, &page).expect("write corrupt file");
+
+    let err = BTree::open(&db_path)
+        .expect_err("corrupt header must fail open");
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("Invalid magic bytes"),
+        "error={err}"
+    );
+
+    let remaining = std::fs::read(&db_path).expect("read");
+    assert_eq!(
+        &remaining[..7],
+        b"NOTBTRE",
+        "must not wipe a corrupt file into a new database"
     );
 }

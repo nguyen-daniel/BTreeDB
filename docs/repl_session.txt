@@ -1,0 +1,26 @@
+B-Tree Database REPL
+Commands:
+  set <key> <value>  - Insert or update a key-value pair
+  get <key>          - Retrieve a value by key
+  delete <key>       - Delete a key-value pair
+  scan [start] [end] - Scan keys in range [start, end)
+  .stats             - Show database statistics
+  .dump              - Dump tree structure
+  .exit              - Exit and flush all data to disk
+
+btreedb> set name Alice
+OK
+btreedb> get name
+Alice
+btreedb> scan
+name -> Alice
+(1 results)
+btreedb> .stats
+Database Statistics:
+  Keys:           1
+  Tree Height:    1
+  Total Pages:    2
+  Leaf Nodes:     1
+  Internal Nodes: 0
+btreedb> .exit
+All data flushed to disk. Goodbye!

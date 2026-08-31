@@ -150,42 +150,43 @@ impl BTree {
 
     /// Creates a new BTree with the given Pager.
     /// Reads the header from page 0 to find the root page ID.
-    /// If the header doesn't exist or is invalid, creates a new database.
+    /// Empty or missing files are initialized as a new database.
+    /// Existing files with invalid magic or a corrupt header fail to open
+    /// and are not overwritten.
     pub fn new(mut pager: Pager) -> io::Result<Self> {
-        // Try to read the header
-        match Self::read_header(&mut pager) {
-            Ok(header) => {
-                // Existing database, use the root from header
-                // Derive next_page_id from actual file size to prevent page overwrites
-                let page_count = pager.page_count()?;
-                let next_page_id = page_count.max(2); // At minimum, page 0 (header) and page 1 (root) exist
-
-                Ok(BTree {
-                    pager,
-                    root_page_id: header.root_page_id,
-                    next_page_id,
-                })
-            }
-            Err(_) => {
-                // New database, create header and initial root
-                let root_page_id = 1; // Root starts at page 1 (page 0 is for header)
-                let next_page_id = 2;
-
-                // Create empty root leaf at page 1
-                let empty_leaf = Node::new_leaf(Vec::new());
-                let buffer = empty_leaf.serialize()?;
-                pager.write_page(root_page_id, &buffer)?;
-
-                // Write the header
-                Self::write_header(&mut pager, root_page_id)?;
-
-                Ok(BTree {
-                    pager,
-                    root_page_id,
-                    next_page_id,
-                })
-            }
+        if pager.page_count()? == 0 {
+            return Self::initialize(pager);
         }
+
+        let header = Self::read_header(&mut pager)?;
+        // Derive next_page_id from actual file size to prevent page overwrites
+        let page_count = pager.page_count()?;
+        // At minimum, page 0 (header) and page 1 (root) exist
+        let next_page_id = page_count.max(2);
+
+        Ok(BTree {
+            pager,
+            root_page_id: header.root_page_id,
+            next_page_id,
+        })
+    }
+
+    /// Initializes an empty database: header on page 0, empty root leaf on page 1.
+    fn initialize(mut pager: Pager) -> io::Result<Self> {
+        let root_page_id = 1; // Root starts at page 1 (page 0 is for header)
+        let next_page_id = 2;
+
+        let empty_leaf = Node::new_leaf(Vec::new());
+        let buffer = empty_leaf.serialize()?;
+        pager.write_page(root_page_id, &buffer)?;
+
+        Self::write_header(&mut pager, root_page_id)?;
+
+        Ok(BTree {
+            pager,
+            root_page_id,
+            next_page_id,
+        })
     }
 
     /// Gets the root page ID.

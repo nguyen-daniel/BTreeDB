@@ -1,5 +1,7 @@
 # BTreeDB
 
+[![CI](https://github.com/nguyen-daniel/BTreeDB/actions/workflows/ci.yml/badge.svg)](https://github.com/nguyen-daniel/BTreeDB/actions/workflows/ci.yml)
+
 On-disk B-tree key-value store in Rust: **4KB pages**, binary node serialization, **splits**, **magic-byte header**, **range scans**, and a **REPL**. Integration tests insert **1,000+ keys**, assert height/splits, and **reopen** the file.
 
 This README describes the **integrated core** (pager → nodes → B-tree → cursor → REPL). Extra modules exist in-tree as experiments; they are not the resume story.
@@ -40,14 +42,34 @@ btreedb> .exit
 
 ## Proof
 
+Captured REPL session ([docs/repl_session.txt](docs/repl_session.txt)):
+
+```
+btreedb> set name Alice
+OK
+btreedb> get name
+Alice
+btreedb> scan
+name -> Alice
+(1 results)
+btreedb> .stats
+Database Statistics:
+  Keys:           1
+  Tree Height:    1
+  Total Pages:    2
+  Leaf Nodes:     1
+  Internal Nodes: 0
+```
+
 | Claim | Test |
 |-------|------|
 | 1000 keys + splits + reopen | `test_1000_keys_persistence_reopen` |
 | Range scan | `test_range_scan_after_splits`, `cursor` unit tests |
 | Magic header / persistence | `test_persistence_across_sessions`, `test_root_splitting_persistence` |
+| Corrupt header fails open | `test_wrong_magic_fails_open` |
 | WAL recover | `test_wal_recovers_zeroed_page` |
 
-Binary vs JSON size comparison (optional, not a resume %): `cargo run --release --bin bench_format` writes `docs/format_bench.json`. Quote that file; do not invent a 60% I/O figure.
+Binary vs JSON size comparison (optional): `cargo run --release --bin bench_format` writes `docs/format_bench.json`. Quote measured sizes from that file; it is not committed.
 
 ## Reproduce
 
