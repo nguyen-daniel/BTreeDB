@@ -6,6 +6,10 @@ use std::path::Path;
 
 const MAX_LEAF_KEYS: usize = 3; // Reduced to 3 to support 1KB values (1024 bytes) in 4KB pages
 const MAX_INTERNAL_KEYS: usize = 10; // Maximum keys in an internal node
+/// Minimum keys in a non-root leaf: ceil(MAX_LEAF_KEYS / 2).
+const MIN_LEAF_KEYS: usize = (MAX_LEAF_KEYS + 1) / 2;
+/// Minimum keys in a non-root internal node: ceil(MAX_INTERNAL_KEYS / 2).
+const MIN_INTERNAL_KEYS: usize = (MAX_INTERNAL_KEYS + 1) / 2;
 const HEADER_SIZE: usize = 100;
 const MAGIC_BYTES: &[u8] = b"BTREEDB";
 const MAGIC_BYTES_LEN: usize = 7;
@@ -23,10 +27,12 @@ enum InsertResult {
 
 /// Result of a delete operation.
 enum DeleteResult {
-    /// Key was found and deleted
+    /// Key was found and deleted; this node still meets occupancy (or is the root).
     Ok,
     /// Key was not found
     NotFound,
+    /// Key was deleted and this non-root node is below minimum occupancy.
+    Underflow,
 }
 
 /// Database header stored in the first 100 bytes of page 0.
@@ -565,70 +571,461 @@ impl BTree {
 
     /// Deletes a key from the B-Tree.
     /// Returns true if the key was found and deleted, false if not found.
-    /// Note: This is a simplified delete that doesn't do node rebalancing.
-    /// Nodes may become sparse after deletions, but the tree remains functional.
+    /// After a non-root node drops below `ceil(MAX_*_KEYS / 2)`, borrows from a
+    /// sibling or merges so the tree stays balanced.
     pub fn delete(&mut self, key: &str) -> io::Result<bool> {
         let result = self.delete_recursive(self.root_page_id, key)?;
 
         match result {
             DeleteResult::NotFound => Ok(false),
-            DeleteResult::Ok => {
-                // Check if root needs to be demoted
+            DeleteResult::Ok | DeleteResult::Underflow => {
                 self.handle_root_demotion()?;
                 Ok(true)
             }
         }
     }
 
-    /// Handles root demotion when root becomes empty or has only one child.
-    fn handle_root_demotion(&mut self) -> io::Result<()> {
-        let page_buffer = self.pager.get_page(self.root_page_id)?;
-        let node = Node::deserialize(&page_buffer)?;
+    /// Leaf occupancies in left-to-right order: `(page_id, key_count)`.
+    pub fn leaf_occupancies(&mut self) -> io::Result<Vec<(u32, usize)>> {
+        let mut out = Vec::new();
+        self.collect_leaf_occupancies(self.root_page_id, &mut out)?;
+        Ok(out)
+    }
 
+    fn collect_leaf_occupancies(
+        &mut self,
+        page_id: u32,
+        out: &mut Vec<(u32, usize)>,
+    ) -> io::Result<()> {
+        let node = self.load_node(page_id)?;
         match node {
-            Node::Internal { children, keys, .. } => {
-                // If internal root has no keys but one child, demote
-                if keys.is_empty() && children.len() == 1 {
-                    self.root_page_id = children[0];
-                    Self::write_header(&mut self.pager, self.root_page_id)?;
-                }
+            Node::Leaf { pairs, .. } => {
+                out.push((page_id, pairs.len()));
             }
-            Node::Leaf { .. } => {
-                // Root is a leaf, no demotion needed
+            Node::Internal { children, .. } => {
+                for child_id in children {
+                    self.collect_leaf_occupancies(child_id, out)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Recursively deletes a key from the tree starting at page_id.
-    /// Note: This is a simplified delete that doesn't do rebalancing (nodes may become empty).
-    fn delete_recursive(&mut self, page_id: u32, key: &str) -> io::Result<DeleteResult> {
+    fn load_node(&mut self, page_id: u32) -> io::Result<Node> {
         let page_buffer = self.pager.get_page(page_id)?;
-        let node = Node::deserialize(&page_buffer)?;
+        Node::deserialize(&page_buffer)
+    }
+
+    fn store_node(&mut self, page_id: u32, node: &Node) -> io::Result<()> {
+        let buffer = node.serialize()?;
+        self.pager.write_page(page_id, &buffer)
+    }
+
+    /// Handles root demotion when root becomes empty or has only one child.
+    fn handle_root_demotion(&mut self) -> io::Result<()> {
+        loop {
+            let node = self.load_node(self.root_page_id)?;
+            match node {
+                Node::Internal { children, keys, .. } => {
+                    if keys.is_empty() && children.len() == 1 {
+                        self.root_page_id = children[0];
+                        Self::write_header(&mut self.pager, self.root_page_id)?;
+                    } else {
+                        break;
+                    }
+                }
+                Node::Leaf { .. } => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively deletes a key starting at `page_id`, then rebalances.
+    fn delete_recursive(&mut self, page_id: u32, key: &str) -> io::Result<DeleteResult> {
+        let node = self.load_node(page_id)?;
 
         match node {
             Node::Leaf { mut pairs, .. } => {
-                // Find and remove the key
                 let pos = pairs.iter().position(|(k, _)| k == key);
                 match pos {
                     Some(idx) => {
                         pairs.remove(idx);
-                        let updated_node = Node::new_leaf(pairs);
-                        let buffer = updated_node.serialize()?;
-                        self.pager.write_page(page_id, &buffer)?;
-                        Ok(DeleteResult::Ok)
+                        let underfull = page_id != self.root_page_id && pairs.len() < MIN_LEAF_KEYS;
+                        self.store_node(page_id, &Node::new_leaf(pairs))?;
+                        if underfull {
+                            Ok(DeleteResult::Underflow)
+                        } else {
+                            Ok(DeleteResult::Ok)
+                        }
                     }
                     None => Ok(DeleteResult::NotFound),
                 }
             }
-            Node::Internal { keys, children, .. } => {
-                // Find the child that contains the key
+            Node::Internal {
+                mut keys,
+                mut children,
+                ..
+            } => {
                 let child_index = Self::find_child_index(&keys, key);
                 let child_page_id = children[child_index];
-
-                // Recursively delete from child
-                self.delete_recursive(child_page_id, key)
+                let result = self.delete_recursive(child_page_id, key)?;
+                match result {
+                    DeleteResult::NotFound => Ok(DeleteResult::NotFound),
+                    DeleteResult::Ok => Ok(DeleteResult::Ok),
+                    DeleteResult::Underflow => {
+                        self.rebalance_child(&mut keys, &mut children, child_index)?;
+                        let underfull =
+                            page_id != self.root_page_id && keys.len() < MIN_INTERNAL_KEYS;
+                        self.store_node(page_id, &Node::new_internal(keys, children))?;
+                        if underfull {
+                            Ok(DeleteResult::Underflow)
+                        } else {
+                            Ok(DeleteResult::Ok)
+                        }
+                    }
+                }
             }
         }
+    }
+
+    fn rebalance_child(
+        &mut self,
+        parent_keys: &mut Vec<String>,
+        parent_children: &mut Vec<u32>,
+        child_index: usize,
+    ) -> io::Result<()> {
+        if parent_children.len() < 2 {
+            return Ok(());
+        }
+
+        let child = self.load_node(parent_children[child_index])?;
+        match child {
+            Node::Leaf { .. } => {
+                self.rebalance_leaf_child(parent_keys, parent_children, child_index)
+            }
+            Node::Internal { .. } => {
+                self.rebalance_internal_child(parent_keys, parent_children, child_index)
+            }
+        }
+    }
+
+    fn sibling_key_count(&mut self, page_id: u32) -> io::Result<usize> {
+        Ok(match self.load_node(page_id)? {
+            Node::Leaf { pairs, .. } => pairs.len(),
+            Node::Internal { keys, .. } => keys.len(),
+        })
+    }
+
+    fn rebalance_leaf_child(
+        &mut self,
+        parent_keys: &mut Vec<String>,
+        parent_children: &mut Vec<u32>,
+        child_index: usize,
+    ) -> io::Result<()> {
+        let child_id = parent_children[child_index];
+        let has_left = child_index > 0;
+        let has_right = child_index + 1 < parent_children.len();
+
+        if has_left {
+            let left_id = parent_children[child_index - 1];
+            if self.sibling_key_count(left_id)? > MIN_LEAF_KEYS {
+                return self.borrow_leaf_from_left(parent_keys, child_index, left_id, child_id);
+            }
+        }
+        if has_right {
+            let right_id = parent_children[child_index + 1];
+            if self.sibling_key_count(right_id)? > MIN_LEAF_KEYS {
+                return self.borrow_leaf_from_right(parent_keys, child_index, child_id, right_id);
+            }
+        }
+        if has_left {
+            let left_id = parent_children[child_index - 1];
+            return self.merge_leaves(
+                parent_keys,
+                parent_children,
+                child_index - 1,
+                left_id,
+                child_id,
+            );
+        }
+        if has_right {
+            let right_id = parent_children[child_index + 1];
+            return self.merge_leaves(
+                parent_keys,
+                parent_children,
+                child_index,
+                child_id,
+                right_id,
+            );
+        }
+        Ok(())
+    }
+
+    fn borrow_leaf_from_left(
+        &mut self,
+        parent_keys: &mut [String],
+        child_index: usize,
+        left_id: u32,
+        child_id: u32,
+    ) -> io::Result<()> {
+        let (mut left_pairs, mut child_pairs) =
+            match (self.load_node(left_id)?, self.load_node(child_id)?) {
+                (Node::Leaf { pairs: left, .. }, Node::Leaf { pairs: child, .. }) => (left, child),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected leaf siblings when borrowing from left",
+                    ));
+                }
+            };
+        let stolen = left_pairs.pop().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "left sibling has no key to lend",
+            )
+        })?;
+        child_pairs.insert(0, stolen);
+        parent_keys[child_index - 1] = child_pairs[0].0.clone();
+        self.store_node(left_id, &Node::new_leaf(left_pairs))?;
+        self.store_node(child_id, &Node::new_leaf(child_pairs))?;
+        Ok(())
+    }
+
+    fn borrow_leaf_from_right(
+        &mut self,
+        parent_keys: &mut [String],
+        child_index: usize,
+        child_id: u32,
+        right_id: u32,
+    ) -> io::Result<()> {
+        let (mut child_pairs, mut right_pairs) =
+            match (self.load_node(child_id)?, self.load_node(right_id)?) {
+                (Node::Leaf { pairs: child, .. }, Node::Leaf { pairs: right, .. }) => {
+                    (child, right)
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected leaf siblings when borrowing from right",
+                    ));
+                }
+            };
+        if right_pairs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "right sibling has no key to lend",
+            ));
+        }
+        let stolen = right_pairs.remove(0);
+        child_pairs.push(stolen);
+        parent_keys[child_index] = right_pairs[0].0.clone();
+        self.store_node(child_id, &Node::new_leaf(child_pairs))?;
+        self.store_node(right_id, &Node::new_leaf(right_pairs))?;
+        Ok(())
+    }
+
+    fn merge_leaves(
+        &mut self,
+        parent_keys: &mut Vec<String>,
+        parent_children: &mut Vec<u32>,
+        left_index: usize,
+        left_id: u32,
+        right_id: u32,
+    ) -> io::Result<()> {
+        let (mut left_pairs, right_pairs) =
+            match (self.load_node(left_id)?, self.load_node(right_id)?) {
+                (Node::Leaf { pairs: left, .. }, Node::Leaf { pairs: right, .. }) => (left, right),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected leaf siblings when merging",
+                    ));
+                }
+            };
+        left_pairs.extend(right_pairs);
+        self.store_node(left_id, &Node::new_leaf(left_pairs))?;
+        parent_keys.remove(left_index);
+        parent_children.remove(left_index + 1);
+        Ok(())
+    }
+
+    fn rebalance_internal_child(
+        &mut self,
+        parent_keys: &mut Vec<String>,
+        parent_children: &mut Vec<u32>,
+        child_index: usize,
+    ) -> io::Result<()> {
+        let child_id = parent_children[child_index];
+        let has_left = child_index > 0;
+        let has_right = child_index + 1 < parent_children.len();
+
+        if has_left {
+            let left_id = parent_children[child_index - 1];
+            if self.sibling_key_count(left_id)? > MIN_INTERNAL_KEYS {
+                return self.borrow_internal_from_left(parent_keys, child_index, left_id, child_id);
+            }
+        }
+        if has_right {
+            let right_id = parent_children[child_index + 1];
+            if self.sibling_key_count(right_id)? > MIN_INTERNAL_KEYS {
+                return self.borrow_internal_from_right(
+                    parent_keys,
+                    child_index,
+                    child_id,
+                    right_id,
+                );
+            }
+        }
+        if has_left {
+            let left_id = parent_children[child_index - 1];
+            return self.merge_internals(
+                parent_keys,
+                parent_children,
+                child_index - 1,
+                left_id,
+                child_id,
+            );
+        }
+        if has_right {
+            let right_id = parent_children[child_index + 1];
+            return self.merge_internals(
+                parent_keys,
+                parent_children,
+                child_index,
+                child_id,
+                right_id,
+            );
+        }
+        Ok(())
+    }
+
+    fn borrow_internal_from_left(
+        &mut self,
+        parent_keys: &mut [String],
+        child_index: usize,
+        left_id: u32,
+        child_id: u32,
+    ) -> io::Result<()> {
+        let (mut left_keys, mut left_children, mut child_keys, mut child_children) =
+            match (self.load_node(left_id)?, self.load_node(child_id)?) {
+                (
+                    Node::Internal {
+                        keys: lk,
+                        children: lc,
+                        ..
+                    },
+                    Node::Internal {
+                        keys: ck,
+                        children: cc,
+                        ..
+                    },
+                ) => (lk, lc, ck, cc),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected internal siblings when borrowing from left",
+                    ));
+                }
+            };
+        let stolen_key = left_keys.pop().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "left sibling has no key to lend",
+            )
+        })?;
+        let stolen_child = left_children.pop().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "left sibling has no child to lend",
+            )
+        })?;
+        let sep = std::mem::replace(&mut parent_keys[child_index - 1], stolen_key);
+        child_keys.insert(0, sep);
+        child_children.insert(0, stolen_child);
+        self.store_node(left_id, &Node::new_internal(left_keys, left_children))?;
+        self.store_node(child_id, &Node::new_internal(child_keys, child_children))?;
+        Ok(())
+    }
+
+    fn borrow_internal_from_right(
+        &mut self,
+        parent_keys: &mut [String],
+        child_index: usize,
+        child_id: u32,
+        right_id: u32,
+    ) -> io::Result<()> {
+        let (mut child_keys, mut child_children, mut right_keys, mut right_children) =
+            match (self.load_node(child_id)?, self.load_node(right_id)?) {
+                (
+                    Node::Internal {
+                        keys: ck,
+                        children: cc,
+                        ..
+                    },
+                    Node::Internal {
+                        keys: rk,
+                        children: rc,
+                        ..
+                    },
+                ) => (ck, cc, rk, rc),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected internal siblings when borrowing from right",
+                    ));
+                }
+            };
+        if right_keys.is_empty() || right_children.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "right sibling has no key/child to lend",
+            ));
+        }
+        let stolen_key = right_keys.remove(0);
+        let stolen_child = right_children.remove(0);
+        let sep = std::mem::replace(&mut parent_keys[child_index], stolen_key);
+        child_keys.push(sep);
+        child_children.push(stolen_child);
+        self.store_node(child_id, &Node::new_internal(child_keys, child_children))?;
+        self.store_node(right_id, &Node::new_internal(right_keys, right_children))?;
+        Ok(())
+    }
+
+    fn merge_internals(
+        &mut self,
+        parent_keys: &mut Vec<String>,
+        parent_children: &mut Vec<u32>,
+        left_index: usize,
+        left_id: u32,
+        right_id: u32,
+    ) -> io::Result<()> {
+        let (mut left_keys, mut left_children, right_keys, right_children) =
+            match (self.load_node(left_id)?, self.load_node(right_id)?) {
+                (
+                    Node::Internal {
+                        keys: lk,
+                        children: lc,
+                        ..
+                    },
+                    Node::Internal {
+                        keys: rk,
+                        children: rc,
+                        ..
+                    },
+                ) => (lk, lc, rk, rc),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected internal siblings when merging",
+                    ));
+                }
+            };
+        let sep = parent_keys.remove(left_index);
+        left_keys.push(sep);
+        left_keys.extend(right_keys);
+        left_children.extend(right_children);
+        self.store_node(left_id, &Node::new_internal(left_keys, left_children))?;
+        parent_children.remove(left_index + 1);
+        Ok(())
     }
 }

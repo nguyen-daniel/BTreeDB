@@ -18,6 +18,17 @@ fn open_db_file(path: &std::path::Path) -> std::fs::File {
         .expect("Failed to open database file")
 }
 
+fn assert_no_empty_non_root_leaves(btree: &mut BTree) {
+    let root = btree.root_page_id();
+    let leaves = btree.leaf_occupancies().expect("leaf occupancies");
+    assert!(!leaves.is_empty(), "tree must have at least one leaf");
+    for (page_id, n) in leaves {
+        if page_id != root {
+            assert!(n > 0, "empty non-root leaf at page {page_id}");
+        }
+    }
+}
+
 #[test]
 fn test_large_scale_insertion() {
     // Create a temporary database file
@@ -717,8 +728,10 @@ fn test_wrong_magic_fails_open() {
     page[..7].copy_from_slice(b"NOTBTRE");
     std::fs::write(&db_path, &page).expect("write corrupt file");
 
-    let err = BTree::open(&db_path)
-        .expect_err("corrupt header must fail open");
+    let err = match BTree::open(&db_path) {
+        Ok(_) => panic!("corrupt header must fail open"),
+        Err(e) => e,
+    };
     assert_eq!(err.kind(), ErrorKind::InvalidData);
     assert!(
         err.to_string().contains("Invalid magic bytes"),
@@ -731,4 +744,174 @@ fn test_wrong_magic_fails_open() {
         b"NOTBTRE",
         "must not wipe a corrupt file into a new database"
     );
+}
+
+/// Insert enough keys to split, delete until a leaf merge fires, reopen,
+/// then check get/scan and that no non-root leaf is empty.
+#[test]
+fn test_delete_merge_reopen() {
+    use btreedb::cursor::Cursor;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("merge.db");
+
+    // MAX_LEAF_KEYS = 3: 24 sequential keys force multiple leaf splits and
+    // an internal-root split (height >= 2, usually 3).
+    const INSERT: usize = 24;
+    const DELETE: usize = 16;
+
+    let leaf_after = {
+        let mut btree = BTree::open(&db_path).expect("open");
+        for i in 0..INSERT {
+            btree
+                .insert(&format!("key_{:04}", i), &format!("value_{}", i))
+                .expect("insert");
+        }
+        let before = btree.stats().expect("stats");
+        assert!(
+            before.leaf_count > 1,
+            "expected splits, leaf_count={}",
+            before.leaf_count
+        );
+        assert!(
+            before.tree_height >= 2,
+            "expected height >= 2 after splits, height={}",
+            before.tree_height
+        );
+
+        for i in 0..DELETE {
+            let key = format!("key_{:04}", i);
+            assert!(btree.delete(&key).expect("delete"), "delete {key}");
+        }
+
+        let after = btree.stats().expect("stats");
+        assert!(
+            after.leaf_count < before.leaf_count,
+            "expected a leaf merge: before={} after={}",
+            before.leaf_count,
+            after.leaf_count
+        );
+        assert_eq!(after.key_count, (INSERT - DELETE) as u64);
+
+        for i in DELETE..INSERT {
+            let key = format!("key_{:04}", i);
+            assert_eq!(
+                btree.get(&key).expect("get"),
+                Some(format!("value_{}", i)),
+                "missing {key} after merge"
+            );
+        }
+        for i in 0..DELETE {
+            assert_eq!(
+                btree.get(&format!("key_{:04}", i)).expect("get"),
+                None,
+                "deleted key still present"
+            );
+        }
+
+        let scan = Cursor::scan_range(&mut btree, None, None).expect("scan");
+        assert_eq!(scan.len(), INSERT - DELETE);
+        for (i, (k, v)) in scan.iter().enumerate() {
+            let idx = DELETE + i;
+            assert_eq!(k, &format!("key_{:04}", idx));
+            assert_eq!(v, &format!("value_{}", idx));
+        }
+
+        assert_no_empty_non_root_leaves(&mut btree);
+        btree.sync().expect("sync");
+        after.leaf_count
+    };
+
+    {
+        let mut btree = BTree::open(&db_path).expect("reopen");
+        let stats = btree.stats().expect("stats");
+        assert_eq!(stats.key_count, (INSERT - DELETE) as u64);
+        assert_eq!(stats.leaf_count, leaf_after);
+        for i in DELETE..INSERT {
+            assert_eq!(
+                btree.get(&format!("key_{:04}", i)).expect("get"),
+                Some(format!("value_{}", i)),
+                "missing after reopen"
+            );
+        }
+        let scan = Cursor::scan_range(&mut btree, None, None).expect("scan");
+        assert_eq!(scan.len(), INSERT - DELETE);
+        assert_no_empty_non_root_leaves(&mut btree);
+    }
+}
+
+/// Height-3 tree: delete until internal nodes merge or the height drops.
+#[test]
+fn test_delete_internal_merge() {
+    use btreedb::cursor::Cursor;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("internal_merge.db");
+
+    const INSERT: usize = 80;
+    const DELETE: usize = 70;
+
+    {
+        let mut btree = BTree::open(&db_path).expect("open");
+        for i in 0..INSERT {
+            btree
+                .insert(&format!("key_{:04}", i), &format!("value_{}", i))
+                .expect("insert");
+        }
+        let before = btree.stats().expect("stats");
+        assert!(
+            before.tree_height >= 3,
+            "expected height >= 3 so internal nodes exist, height={}",
+            before.tree_height
+        );
+        assert!(
+            before.internal_count >= 2,
+            "need sibling internals to merge"
+        );
+
+        for i in 0..DELETE {
+            let key = format!("key_{:04}", i);
+            assert!(btree.delete(&key).expect("delete"), "delete {key}");
+        }
+
+        let after = btree.stats().expect("stats");
+        assert_eq!(after.key_count, (INSERT - DELETE) as u64);
+        assert!(
+            after.internal_count < before.internal_count || after.tree_height < before.tree_height,
+            "expected internal merge or height drop: internals {}→{}, height {}→{}",
+            before.internal_count,
+            after.internal_count,
+            before.tree_height,
+            after.tree_height
+        );
+
+        for i in DELETE..INSERT {
+            assert_eq!(
+                btree.get(&format!("key_{:04}", i)).expect("get"),
+                Some(format!("value_{}", i))
+            );
+        }
+        let scan = Cursor::scan_range(&mut btree, None, None).expect("scan");
+        assert_eq!(scan.len(), INSERT - DELETE);
+        assert_no_empty_non_root_leaves(&mut btree);
+        btree.sync().expect("sync");
+    }
+
+    {
+        let mut btree = BTree::open(&db_path).expect("reopen");
+        assert_eq!(
+            btree.stats().expect("stats").key_count,
+            (INSERT - DELETE) as u64
+        );
+        for i in DELETE..INSERT {
+            assert_eq!(
+                btree.get(&format!("key_{:04}", i)).expect("get"),
+                Some(format!("value_{}", i)),
+                "missing after reopen"
+            );
+        }
+        let scan = Cursor::scan_range(&mut btree, None, None).expect("scan");
+        assert_eq!(scan.len(), INSERT - DELETE);
+        assert_no_empty_non_root_leaves(&mut btree);
+    }
 }
