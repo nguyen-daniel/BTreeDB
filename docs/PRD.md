@@ -392,7 +392,7 @@ The database provides a simple yet complete implementation that can store and re
 - **Single-file**: Database stored in single file
 - **Fixed page size**: 4KB pages (not configurable)
 - **No transactions**: No rollback or atomicity guarantees
-- **No WAL**: Direct page writes (no write-ahead logging)
+- **No full SQL transactions**: No multi-statement rollback. WAL is on `BTree::open` / `Pager::open` (log page, then apply; replay on open). `Pager::new(file)` writes pages directly (tests).
 
 ### 8.2 Scalability Constraints
 - **File size**: Limited by file system (typically 2GB+)
