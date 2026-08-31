@@ -2,6 +2,7 @@ use crate::node::Node;
 use crate::pager::Pager;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
+use std::path::Path;
 
 const MAX_LEAF_KEYS: usize = 3; // Reduced to 3 to support 1KB values (1024 bytes) in 4KB pages
 const MAX_INTERNAL_KEYS: usize = 10; // Maximum keys in an internal node
@@ -142,6 +143,11 @@ impl BTree {
         pager.write_page(0, &page_buffer)
     }
 
+    /// Opens a database file, recovers from the WAL if present, then logs writes.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new(Pager::open(path)?)
+    }
+
     /// Creates a new BTree with the given Pager.
     /// Reads the header from page 0 to find the root page ID.
     /// If the header doesn't exist or is invalid, creates a new database.
@@ -187,9 +193,10 @@ impl BTree {
         self.root_page_id
     }
 
-    /// Syncs all data to disk by flushing the underlying file.
+    /// Syncs all data to disk, then checkpoints the WAL.
     pub fn sync(&mut self) -> io::Result<()> {
-        self.pager.file_mut().sync_all()
+        self.pager.file_mut().sync_all()?;
+        self.pager.checkpoint()
     }
 
     /// Returns a mutable reference to the pager.
