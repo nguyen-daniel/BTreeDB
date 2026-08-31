@@ -132,7 +132,7 @@ The database provides a simple yet complete implementation that can store and re
 - **Acceptance Criteria**:
   - Search operations are O(log n) complexity
   - Insert operations are O(log n) complexity
-  - Tree maintains balance through automatic splitting
+  - Tree maintains balance through automatic splitting and merging
   - Tree height grows logarithmically with data size
 
 #### F4: Interactive REPL
@@ -444,9 +444,10 @@ The database provides a simple yet complete implementation that can store and re
 ### 10.3 Phase 1: Delete Operations - ✅ Complete
 - [x] Add `delete` method to BTree (`src/btree.rs`)
 - [x] Implement key removal from leaf nodes
+- [x] Borrow from a sibling or merge after occupancy drops below `ceil(MAX_*_KEYS / 2)`
 - [x] Handle root demotion when root becomes empty
 - [x] Add `delete <key>` command to REPL
-- [x] Integration tests for deletion
+- [x] Integration tests for deletion, merge, and reopen
 
 ### 10.4 Phase 2: Cursor and Range Queries - ✅ Complete
 - [x] Create `Cursor` struct for tree traversal (`src/cursor.rs`)
@@ -461,11 +462,10 @@ The database provides a simple yet complete implementation that can store and re
 - [x] Add `.dump` command for tree visualization
 - [x] Implement `DatabaseStats` struct and collection methods
 
-### 10.6 Phase 4: Multiple Value Types - ✅ Complete
-- [x] Create `Value` enum with type tag (String, Integer, Float, Binary, Null)
-- [x] Implement serialization/deserialization with type prefix byte
-- [x] Add parsing support for type prefixes (`i:`, `f:`, `b:`, `s:`, `null`)
-- [x] Unit tests for value operations
+### 10.6 Phase 4: Multiple Value Types - ❌ Not complete
+Scaffolding in `src/value.rs` is compiled only with `--features experimental`. On-disk values remain UTF-8 strings.
+- [ ] `Value` types used by the pager / node serializer
+- [ ] REPL parsing of type prefixes (`i:`, `f:`, `b:`, `s:`, `null`) on `set` / `get`
 
 ### 10.7 Phase 5: Write-Ahead Logging (WAL) - ✅ Complete
 - [x] Create WAL file (`*.db-wal`) alongside main database
@@ -474,36 +474,30 @@ The database provides a simple yet complete implementation that can store and re
 - [x] Implement recovery module for replaying WAL on startup
 - [x] Unit tests for WAL operations
 
-### 10.8 Phase 6: Transaction Support - ✅ Complete
-- [x] Implement `Transaction` struct with begin/commit/rollback
-- [x] Create `TransactionManager` for coordinating transactions
-- [x] Add savepoints for nested transaction support
-- [x] Unit tests for transaction operations
+### 10.8 Phase 6: Transaction Support - ❌ Not complete
+Scaffolding in `src/transaction.rs` is compiled only with `--features experimental`. It is not wired into the engine.
+- [ ] Begin/commit/rollback on the write path
+- [ ] TransactionManager coordinating real page writes
+- [ ] Savepoints with rollback that restores pages
 
-### 10.9 Phase 7: Value Compression - ✅ Complete
-- [x] Implement RLE compression for educational purposes
-- [x] Add compression flag and threshold support
-- [x] Create `CompressedData` struct with serialization
-- [x] Add `CompressionStats` for tracking compression effectiveness
-- [x] Unit tests for compression operations
+### 10.9 Phase 7: Value Compression - ❌ Not complete
+Scaffolding in `src/compression.rs` is compiled only with `--features experimental`. Values on disk are uncompressed strings.
+- [ ] Compression on the storage path
+- [ ] Threshold / flag honored by the pager or node serializer
 
-### 10.10 Phase 8: Backup and Restore - ✅ Complete
-- [x] Implement backup/restore functions with WAL support
-- [x] Add backup verification functionality
-- [x] Create `BackupInfo` struct for backup metadata
-- [x] Unit tests for backup operations
+### 10.10 Phase 8: Backup and Restore - ❌ Not complete
+Scaffolding in `src/backup.rs` is compiled only with `--features experimental`. Not invoked by the REPL or `BTree::open`.
+- [ ] Backup/restore wired to a user command or API used by the engine
+- [ ] Consistent backup of WAL + data file
 
-### 10.11 Phase 9: Multiple Database Support - ✅ Complete
-- [x] Create `DatabaseManager` to handle multiple instances
-- [x] Add `DatabaseConfig` for database configuration
-- [x] Implement `DatabaseHandle` for managed database access
-- [x] Unit tests for multi-database operations
+### 10.11 Phase 9: Multiple Database Support - ❌ Not complete
+Scaffolding in `src/manager.rs` is compiled only with `--features experimental`. The process opens one `BTree` at a time.
+- [ ] DatabaseManager used by the REPL or library API
 
-### 10.12 Phase 10: Concurrent Access - ✅ Complete
-- [x] Implement `PageLock` with read-write semantics
-- [x] Create `LockManager` for page-level locking
-- [x] Add `ConnectionPool` for connection management
-- [x] Unit tests for concurrent access patterns
+### 10.12 Phase 10: Concurrent Access - ❌ Not complete
+Scaffolding in `src/concurrency.rs` is compiled only with `--features experimental`. The engine is single-threaded.
+- [ ] Page locks on the I/O path
+- [ ] Connection pool used by real clients
 
 ### 10.13 Implementation Priority Matrix
 
