@@ -113,8 +113,8 @@ pub struct WAL {
     /// Path to the WAL file (kept for potential future use)
     #[allow(dead_code)]
     path: PathBuf,
-    /// File handle for the WAL
-    file: File,
+    /// File handle for the WAL (`None` when disabled)
+    file: Option<File>,
     /// Current write position in the WAL
     write_offset: u64,
     /// Whether the WAL is enabled
@@ -135,13 +135,13 @@ impl WAL {
 
         let mut wal = WAL {
             path: wal_path,
-            file,
+            file: Some(file),
             write_offset: 0,
             enabled: true,
         };
 
         // Initialize or validate header
-        let file_len = wal.file.seek(SeekFrom::End(0))?;
+        let file_len = wal.file_mut()?.seek(SeekFrom::End(0))?;
         if file_len == 0 {
             // New WAL file, write header
             wal.write_header()?;
@@ -156,13 +156,18 @@ impl WAL {
 
     /// Creates a disabled (no-op) WAL for testing.
     pub fn disabled() -> Self {
-        // Create a dummy file that won't be used
         WAL {
             path: PathBuf::new(),
-            file: unsafe { std::mem::zeroed() }, // Never used
+            file: None,
             write_offset: 0,
             enabled: false,
         }
+    }
+
+    fn file_mut(&mut self) -> io::Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("WAL is disabled"))
     }
 
     /// Returns the WAL file path for a database path.
@@ -175,13 +180,16 @@ impl WAL {
 
     /// Writes the WAL header.
     fn write_header(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
+        {
+            let file = self.file_mut()?;
+            file.seek(SeekFrom::Start(0))?;
 
-        let mut header = [0u8; WAL_HEADER_SIZE];
-        header[..WAL_MAGIC_LEN].copy_from_slice(WAL_MAGIC);
+            let mut header = [0u8; WAL_HEADER_SIZE];
+            header[..WAL_MAGIC_LEN].copy_from_slice(WAL_MAGIC);
 
-        self.file.write_all(&header)?;
-        self.file.sync_all()?;
+            file.write_all(&header)?;
+            file.sync_all()?;
+        }
 
         self.write_offset = WAL_HEADER_SIZE as u64;
         Ok(())
@@ -189,10 +197,11 @@ impl WAL {
 
     /// Validates the WAL header.
     fn validate_header(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
+        let file = self.file_mut()?;
+        file.seek(SeekFrom::Start(0))?;
 
         let mut header = [0u8; WAL_HEADER_SIZE];
-        self.file.read_exact(&mut header)?;
+        file.read_exact(&mut header)?;
 
         if &header[..WAL_MAGIC_LEN] != WAL_MAGIC {
             return Err(io::Error::new(
@@ -211,17 +220,18 @@ impl WAL {
         }
 
         let record = WalRecord::new(page_id, *data);
+        let offset = self.write_offset;
 
-        self.file.seek(SeekFrom::Start(self.write_offset))?;
+        self.file_mut()?.seek(SeekFrom::Start(offset))?;
 
         {
-            let mut writer = BufWriter::new(&mut self.file);
+            let mut writer = BufWriter::new(self.file_mut()?);
             record.serialize(&mut writer)?;
             writer.flush()?;
         }
 
         // Sync to ensure durability
-        self.file.sync_all()?;
+        self.file_mut()?.sync_all()?;
 
         self.write_offset += (WAL_RECORD_HEADER_SIZE + PAGE_SIZE) as u64;
 
@@ -246,8 +256,9 @@ impl WAL {
 
         let mut records = Vec::new();
 
-        self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
-        let mut reader = BufReader::new(&mut self.file);
+        let file = self.file_mut()?;
+        file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        let mut reader = BufReader::new(file);
 
         loop {
             match WalRecord::deserialize(&mut reader) {
@@ -268,9 +279,12 @@ impl WAL {
         }
 
         // Truncate the file to just the header
-        self.file.set_len(WAL_HEADER_SIZE as u64)?;
+        {
+            let file = self.file_mut()?;
+            file.set_len(WAL_HEADER_SIZE as u64)?;
+            file.sync_all()?;
+        }
         self.write_offset = WAL_HEADER_SIZE as u64;
-        self.file.sync_all()?;
 
         Ok(())
     }
@@ -278,7 +292,7 @@ impl WAL {
     /// Syncs the WAL to disk.
     pub fn sync(&mut self) -> io::Result<()> {
         if self.enabled {
-            self.file.sync_all()
+            self.file_mut()?.sync_all()
         } else {
             Ok(())
         }
@@ -386,6 +400,18 @@ mod tests {
         // Checkpoint
         wal.checkpoint().unwrap();
         assert!(!wal.has_records());
+    }
+
+    #[test]
+    fn test_wal_disabled_is_noop() {
+        let mut wal = WAL::disabled();
+        let mut data = [0u8; PAGE_SIZE];
+        data[0] = 0x42;
+        wal.log_page(1, &data).unwrap();
+        assert!(!wal.has_records());
+        assert!(wal.read_records().unwrap().is_empty());
+        wal.checkpoint().unwrap();
+        wal.sync().unwrap();
     }
 
     #[test]

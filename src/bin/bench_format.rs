@@ -1,5 +1,5 @@
 //! Binary 4KB pages vs JSON-lines for the same 1000 keys.
-//! Writes measured sizes — does not assume a 60% I/O win.
+//! Writes measured sizes for a fair comparison; quote the output file.
 //!
 //!   cargo run --release --bin bench_format
 
@@ -58,7 +58,6 @@ fn main() -> std::io::Result<()> {
   "jsonl_write_ms": {json_ms:.3},
   "btree_over_jsonl_size": {size_ratio:.4},
   "size_reduction_vs_jsonl": {size_reduction:.4},
-  "resume_claim": "60% I/O overhead reduction — not asserted; quote this file",
   "note": "Fair comparison: same 1000 string KV pairs. B-tree uses 4KB pages (internal fragmentation). JSONL is a naive dump, not a database."
 }}"#
     );
