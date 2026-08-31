@@ -34,4 +34,7 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Run tests with experimental modules
+        run: cargo test --verbose --features experimental
+
 
