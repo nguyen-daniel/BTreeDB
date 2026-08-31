@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+default = []
+# Scaffolding modules (transaction, compression, concurrency, backup, value, manager).
+experimental = []
+
 [dependencies]
 byteorder = "1.5"
 rustyline = "14.0"
