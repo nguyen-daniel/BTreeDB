@@ -7,9 +7,9 @@ use std::path::Path;
 const MAX_LEAF_KEYS: usize = 3; // Reduced to 3 to support 1KB values (1024 bytes) in 4KB pages
 const MAX_INTERNAL_KEYS: usize = 10; // Maximum keys in an internal node
 /// Minimum keys in a non-root leaf: ceil(MAX_LEAF_KEYS / 2).
-const MIN_LEAF_KEYS: usize = (MAX_LEAF_KEYS + 1) / 2;
+const MIN_LEAF_KEYS: usize = MAX_LEAF_KEYS.div_ceil(2);
 /// Minimum keys in a non-root internal node: ceil(MAX_INTERNAL_KEYS / 2).
-const MIN_INTERNAL_KEYS: usize = (MAX_INTERNAL_KEYS + 1) / 2;
+const MIN_INTERNAL_KEYS: usize = MAX_INTERNAL_KEYS.div_ceil(2);
 const HEADER_SIZE: usize = 100;
 const MAGIC_BYTES: &[u8] = b"BTREEDB";
 const MAGIC_BYTES_LEN: usize = 7;
