@@ -149,8 +149,8 @@ The database provides a simple yet complete implementation that can store and re
 - **Description**: Automatic splitting when nodes exceed capacity
 - **Priority**: P0 (Must Have)
 - **Acceptance Criteria**:
-  - Leaf nodes split when exceeding MAX_LEAF_KEYS
-  - Internal nodes split when exceeding MAX_INTERNAL_KEYS
+  - Leaf nodes split when a serialized leaf would exceed the 4KB page
+  - Internal nodes split when exceeding MAX_INTERNAL_KEYS (or the page)
   - Root node splitting creates new root level
   - Splits maintain tree balance
 
@@ -161,7 +161,8 @@ The database provides a simple yet complete implementation that can store and re
 - **Priority**: P1 (Should Have)
 - **Acceptance Criteria**:
   - Contains magic bytes for file identification
-  - Tracks root page ID
+  - Stores format version and page size
+  - Tracks root page ID and freelist head
   - Provides reserved space for future use
   - Header is validated on database open
 
@@ -243,12 +244,15 @@ The database provides a simple yet complete implementation that can store and re
 ### 5.2 Data Format Requirements
 
 #### 5.2.1 Page Layout
-- **Page Size**: 4096 bytes (4KB)
+- **Page Size**: 4096 bytes (4KB), stored in the header and shared as `PAGE_SIZE`
 - **Page 0**: Database header (first 100 bytes)
   - Bytes 0-6: Magic bytes "BTREEDB"
-  - Bytes 7-10: Root page ID (u32, little-endian)
-  - Bytes 11-99: Reserved for future use
-- **Page 1+**: B-Tree nodes
+  - Bytes 7-8: Format version (u16, little-endian; currently 1)
+  - Bytes 9-12: Page size (u32, little-endian; must match `PAGE_SIZE`)
+  - Bytes 13-16: Root page ID (u32, little-endian)
+  - Bytes 17-20: Freelist head page ID (u32, little-endian; 0 = empty)
+  - Bytes 21-99: Reserved for future use
+- **Page 1+**: B-Tree nodes (or free-page records: marker `0xFF` + next free id)
 
 #### 5.2.2 Node Serialization Format
 - **Byte 0**: Node type (0 = Leaf, 1 = Internal)
@@ -268,9 +272,8 @@ The database provides a simple yet complete implementation that can store and re
 - **Remainder**: Zero-padded to exactly 4096 bytes
 
 #### 5.2.3 Node Capacity Constraints
-- **MAX_LEAF_KEYS**: 3 (configurable, reduced to support 1KB values)
-- **MAX_INTERNAL_KEYS**: 10 (configurable)
-- Nodes must fit within single 4KB page
+- **Leaves**: pack by byte budget until the serialized node would exceed 4KB (supports ~1KB values; short keys fill the page)
+- **MAX_INTERNAL_KEYS**: 10 (count cap; also must fit in a 4KB page)
 - Serialization must validate size constraints
 
 ### 5.3 Performance Requirements
@@ -294,9 +297,10 @@ The database provides a simple yet complete implementation that can store and re
 ### 5.4 Reliability Requirements
 
 #### 5.4.1 Data Durability
-- All writes must be flushed to disk on `.exit` command
-- File system sync ensures data survives crashes
-- Magic bytes verify database file integrity
+- Crash safety is WAL-first: each `write_page` with a WAL attached fsyncs the WAL, then flushes the DB file without fsyncing it
+- `BTree::sync` (REPL `.exit`) fsyncs the DB file and checkpoints the WAL
+- Recovery replays the WAL, fsyncs the DB file, then checkpoints
+- Magic bytes and format version verify file integrity
 - Header validation prevents corruption
 
 #### 5.4.2 Error Handling
@@ -314,8 +318,8 @@ The database provides a simple yet complete implementation that can store and re
 ### 5.5 Compatibility Requirements
 
 #### 5.5.1 Platform Support
-- **Primary**: Unix-like systems (Linux, macOS)
-- **Secondary**: Windows (if file I/O is compatible)
+- **Primary**: Linux (CI is Ubuntu)
+- **Secondary**: Windows / macOS (file I/O is portable; not covered by CI)
 - **Architecture**: Little-endian (for serialization)
 
 #### 5.5.2 Rust Version
@@ -392,7 +396,7 @@ The database provides a simple yet complete implementation that can store and re
 - **Single-file**: Database stored in single file
 - **Fixed page size**: 4KB pages (not configurable)
 - **No transactions**: No rollback or atomicity guarantees
-- **No full SQL transactions**: No multi-statement rollback. WAL is on `BTree::open` / `Pager::open` (log page, then apply; replay on open). `Pager::new(file)` writes pages directly (tests).
+- **No full SQL transactions**: No multi-statement rollback. WAL is on `BTree::open` / `Pager::open` (log page and fsync WAL, then apply; replay on open). `Pager::new(file)` writes pages directly without WAL. DB-file fsync happens on `BTree::sync` and recovery, not on every write.
 
 ### 8.2 Scalability Constraints
 - **File size**: Limited by file system (typically 2GB+)

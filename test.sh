@@ -34,21 +34,14 @@ echo ""
 echo "6. Testing individual modules..."
 echo "   - Testing cursor module..."
 cargo test cursor:: --lib -- --quiet
-echo "   - Testing value module..."
-cargo test value:: --lib -- --quiet
 echo "   - Testing wal module..."
 cargo test wal:: --lib -- --quiet
-echo "   - Testing transaction module..."
-cargo test transaction:: --lib -- --quiet
-echo "   - Testing compression module..."
-cargo test compression:: --lib -- --quiet
-echo "   - Testing backup module..."
-cargo test backup:: --lib -- --quiet
-echo "   - Testing manager module..."
-cargo test manager:: --lib -- --quiet
-echo "   - Testing concurrency module..."
-cargo test concurrency:: --lib -- --quiet
-echo "   All module tests passed"
+echo "   All default-path module tests passed"
+
+echo ""
+echo "6b. Testing experimental modules (--features experimental)..."
+cargo test --features experimental --lib -- --quiet
+echo "   Experimental module tests passed"
 
 echo ""
 echo "7. Running doc tests..."

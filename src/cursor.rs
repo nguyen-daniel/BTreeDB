@@ -257,15 +257,13 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pager::Pager;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
-    fn create_test_btree() -> (BTree, tempfile::TempPath) {
-        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        let (file, path) = temp_file.into_parts();
-        let pager = Pager::new(file);
-        let btree = BTree::new(pager).expect("Failed to create BTree");
-        (btree, path)
+    fn create_test_btree() -> (BTree, TempDir) {
+        let dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let path = dir.path().join("test.db");
+        let btree = BTree::open(&path).expect("Failed to create BTree");
+        (btree, dir)
     }
 
     #[test]

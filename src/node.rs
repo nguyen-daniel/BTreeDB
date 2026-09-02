@@ -1,8 +1,6 @@
+use crate::PAGE_SIZE;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
-
-/// Page size in bytes (4KB)
-pub const PAGE_SIZE: usize = 4096;
 
 /// Maximum allowed key length (prevents OOM from corrupted data)
 /// Set to PAGE_SIZE - header overhead to be safe
@@ -11,10 +9,12 @@ const MAX_KEY_LEN: u32 = PAGE_SIZE as u32 - 16;
 /// Maximum allowed value length (prevents OOM from corrupted data)
 const MAX_VALUE_LEN: u32 = PAGE_SIZE as u32 - 16;
 
-/// Maximum number of keys per node (prevents excessive allocations)
-/// Internal nodes: MAX_INTERNAL_KEYS = 10, Leaf nodes: MAX_LEAF_KEYS = 3
-/// We use a generous limit here for validation
+/// Maximum number of keys per node (prevents excessive allocations).
+/// Leaves pack until the page fills; internals cap at MAX_INTERNAL_KEYS.
 const MAX_NUM_KEYS: u32 = 1000;
+
+/// node_type (1) + num_keys (4)
+pub(crate) const NODE_HEADER_LEN: usize = 5;
 
 /// Node type identifier
 #[repr(u8)]
@@ -74,6 +74,40 @@ impl Node {
             num_keys: pairs.len() as u32,
             pairs,
         }
+    }
+
+    /// Encoded size of one leaf key/value pair (length prefixes + bytes).
+    pub(crate) fn pair_encoded_len(key: &str, value: &str) -> usize {
+        8 + key.len() + value.len()
+    }
+
+    /// Serialized size of a leaf with `pairs` (header + payload), not padded.
+    pub(crate) fn leaf_encoded_len(pairs: &[(String, String)]) -> usize {
+        NODE_HEADER_LEN
+            + pairs
+                .iter()
+                .map(|(k, v)| Self::pair_encoded_len(k, v))
+                .sum::<usize>()
+    }
+
+    /// Whether concatenating two leaves still fits in one page.
+    pub(crate) fn merged_leaf_fits(left: &[(String, String)], right: &[(String, String)]) -> bool {
+        Self::leaf_encoded_len(left) + Self::leaf_encoded_len(right) - NODE_HEADER_LEN <= PAGE_SIZE
+    }
+
+    /// Whether `pairs` fit in a single page.
+    pub(crate) fn leaf_fits(pairs: &[(String, String)]) -> bool {
+        Self::leaf_encoded_len(pairs) <= PAGE_SIZE
+    }
+
+    /// Serialized size of an internal node (header + keys + child ids), not padded.
+    pub(crate) fn internal_encoded_len(keys: &[String], children: &[u32]) -> usize {
+        NODE_HEADER_LEN + keys.iter().map(|k| 4 + k.len()).sum::<usize>() + children.len() * 4
+    }
+
+    /// Whether an internal node with `keys` / `children` fits in a single page.
+    pub(crate) fn internal_fits(keys: &[String], children: &[u32]) -> bool {
+        Self::internal_encoded_len(keys, children) <= PAGE_SIZE
     }
 
     /// Returns the node type.
