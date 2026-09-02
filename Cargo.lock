@@ -40,6 +40,7 @@ name = "btreedb"
 version = "0.1.0"
 dependencies = [
  "byteorder",
+ "crc32fast",
  "criterion",
  "rustyline",
  "tempfile",
@@ -134,6 +135,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "crc32fast"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]

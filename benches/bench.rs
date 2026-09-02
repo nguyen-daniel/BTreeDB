@@ -127,9 +127,8 @@ fn bench_write_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_throughput");
     group.sample_size(10); // Criterion requires at least 10 samples
 
-    // Test at various milestones (reduced to avoid disk space issues)
-    // With 1KB values and MAX_LEAF_KEYS=3, large datasets consume significant disk space
-    // 100K records ≈ 100MB+, 250K ≈ 250MB+ per benchmark iteration
+    // Test at various milestones (reduced to avoid disk space issues).
+    // 1KB values pack a few pairs per 4KB leaf; 100K records ≈ 100MB+ per iteration.
     let milestones = vec![10_000, 50_000, 100_000, 250_000];
 
     for &target_count in &milestones {
@@ -140,8 +139,7 @@ fn bench_write_throughput(c: &mut Criterion) {
                 b.iter_with_setup(
                     || create_btree(),
                     |(mut btree, _temp_file)| {
-                        // Create 1KB value (1024 bytes)
-                        // Note: MAX_LEAF_KEYS is set to 3 to accommodate 1KB values in 4KB pages
+                        // Create 1KB value (1024 bytes); leaves pack by byte budget.
                         let value_1kb = "x".repeat(1024);
 
                         let start = Instant::now();
@@ -188,7 +186,6 @@ fn bench_lookup_latency(c: &mut Criterion) {
                     || {
                         // Setup: Create a database with db_size entries
                         let (mut btree, file_path) = create_btree();
-                        // Use 1KB values (1024 bytes) - MAX_LEAF_KEYS is set to 3 to support this
                         let value_1kb = "x".repeat(1024);
 
                         // Insert all records
@@ -274,7 +271,6 @@ fn bench_storage_efficiency(c: &mut Criterion) {
                 b.iter_with_setup(
                     || {
                         let (mut btree, file_path) = create_btree();
-                        // Use 1KB values (1024 bytes) - MAX_LEAF_KEYS is set to 3 to support this
                         let value_1kb = "x".repeat(1024);
 
                         // Insert all records
@@ -334,8 +330,8 @@ fn bench_storage_efficiency(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmarks recovery time: Measures how quickly the database reloads its state
-/// (re-reading the root page ID and reconstructing the tree) after a crash simulation.
+/// Benchmarks reopen time after a clean `BTree::sync`, using `Pager::new` (no WAL).
+/// This measures header/tree reload, not WAL crash recovery.
 fn bench_recovery_time(c: &mut Criterion) {
     let mut group = c.benchmark_group("recovery_time");
     group.sample_size(10);
@@ -353,7 +349,6 @@ fn bench_recovery_time(c: &mut Criterion) {
                     || {
                         // Setup: Create a database with db_size entries
                         let (mut btree, file_path) = create_btree();
-                        // Use 1KB values (1024 bytes) - MAX_LEAF_KEYS is set to 3 to support this
                         let value_1kb = "x".repeat(1024);
 
                         // Insert all records
@@ -362,16 +357,14 @@ fn bench_recovery_time(c: &mut Criterion) {
                             btree.insert(&key, &value_1kb).expect("Failed to insert");
                         }
 
-                        // Sync to ensure all data is written
                         btree.sync().expect("Failed to sync");
-
-                        // Drop the BTree to simulate a crash
+                        // Drop after sync; reopen below uses Pager::new (no WAL replay).
                         drop(btree);
 
                         file_path
                     },
                     |file_path| {
-                        // Benchmark: Reopen the database (recovery)
+                        // Benchmark: reopen the synced file without WAL.
                         let start = Instant::now();
 
                         let file = OpenOptions::new()
@@ -380,16 +373,15 @@ fn bench_recovery_time(c: &mut Criterion) {
                             .open(&file_path)
                             .expect("Failed to reopen file");
                         let pager = Pager::new(file);
-                        let btree = BTree::new(pager).expect("Failed to recover BTree");
+                        let btree = BTree::new(pager).expect("Failed to reopen BTree");
 
                         let elapsed = start.elapsed();
 
-                        // Verify recovery by reading root page ID
                         let root_id = btree.root_page_id();
                         black_box(root_id);
 
                         eprintln!(
-                            "Recovery time for {} records: {:?} ({:.2} ms)",
+                            "Reopen time for {} records: {:?} ({:.2} ms)",
                             db_size,
                             elapsed,
                             elapsed.as_secs_f64() * 1000.0

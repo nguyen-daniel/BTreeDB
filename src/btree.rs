@@ -210,9 +210,19 @@ impl BTree {
         let root_page_id = 1; // Root starts at page 1 (page 0 is for header)
         let next_page_id = 2;
 
+        pager.begin_write_group()?;
         let empty_leaf = Node::new_leaf(Vec::new());
-        let buffer = empty_leaf.serialize()?;
-        pager.write_page(root_page_id, &buffer)?;
+        let buffer = match empty_leaf.serialize() {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                pager.abort_write_group();
+                return Err(err);
+            }
+        };
+        if let Err(err) = pager.write_page(root_page_id, &buffer) {
+            pager.abort_write_group();
+            return Err(err);
+        }
 
         let mut tree = BTree {
             pager,
@@ -220,8 +230,31 @@ impl BTree {
             next_page_id,
             freelist_head: 0,
         };
-        tree.write_header()?;
-        Ok(tree)
+        match tree.write_header() {
+            Ok(()) => tree.pager.commit_write_group().map(|()| tree),
+            Err(err) => {
+                tree.pager.abort_write_group();
+                Err(err)
+            }
+        }
+    }
+
+    /// Buffers every page write in `f` into one WAL frame, then applies them.
+    fn with_write_group<F, T>(&mut self, f: F) -> io::Result<T>
+    where
+        F: FnOnce(&mut Self) -> io::Result<T>,
+    {
+        self.pager.begin_write_group()?;
+        match f(self) {
+            Ok(value) => {
+                self.pager.commit_write_group()?;
+                Ok(value)
+            }
+            Err(err) => {
+                self.pager.abort_write_group();
+                Err(err)
+            }
+        }
     }
 
     /// Gets the root page ID.
@@ -442,6 +475,9 @@ impl BTree {
     }
 
     /// Inserts a key-value pair into the B-Tree.
+    ///
+    /// All page writes from this call (including a split or new root) are one
+    /// WAL frame when a WAL is attached.
     pub fn insert(&mut self, key: &str, value: &str) -> io::Result<()> {
         if Node::pair_encoded_len(key, value) + crate::node::NODE_HEADER_LEN > PAGE_SIZE {
             return Err(io::Error::new(
@@ -450,18 +486,20 @@ impl BTree {
             ));
         }
 
-        let result = self.insert_recursive(self.root_page_id, key, value)?;
+        self.with_write_group(|tree| {
+            let result = tree.insert_recursive(tree.root_page_id, key, value)?;
 
-        match result {
-            InsertResult::NoSplit => Ok(()),
-            InsertResult::Split {
-                separator_key,
-                new_page_id,
-            } => {
-                // Root was split, create a new root
-                self.create_new_root(self.root_page_id, separator_key, new_page_id)
+            match result {
+                InsertResult::NoSplit => Ok(()),
+                InsertResult::Split {
+                    separator_key,
+                    new_page_id,
+                } => {
+                    // Root was split, create a new root
+                    tree.create_new_root(tree.root_page_id, separator_key, new_page_id)
+                }
             }
-        }
+        })
     }
 
     /// Recursively inserts a key-value pair into the tree.
@@ -664,16 +702,21 @@ impl BTree {
     /// After a non-root leaf drops below half-page occupancy (or a non-root
     /// internal below `ceil(MAX_INTERNAL_KEYS / 2)`), borrows from a sibling
     /// or merges so the tree stays balanced.
+    ///
+    /// All page writes from this call (including a merge or root demotion)
+    /// are one WAL frame when a WAL is attached.
     pub fn delete(&mut self, key: &str) -> io::Result<bool> {
-        let result = self.delete_recursive(self.root_page_id, key)?;
+        self.with_write_group(|tree| {
+            let result = tree.delete_recursive(tree.root_page_id, key)?;
 
-        match result {
-            DeleteResult::NotFound => Ok(false),
-            DeleteResult::Ok | DeleteResult::Underflow => {
-                self.handle_root_demotion()?;
-                Ok(true)
+            match result {
+                DeleteResult::NotFound => Ok(false),
+                DeleteResult::Ok | DeleteResult::Underflow => {
+                    tree.handle_root_demotion()?;
+                    Ok(true)
+                }
             }
-        }
+        })
     }
 
     /// Leaf occupancies in left-to-right order: `(page_id, key_count)`.

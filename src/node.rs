@@ -10,7 +10,8 @@ const MAX_KEY_LEN: u32 = PAGE_SIZE as u32 - 16;
 const MAX_VALUE_LEN: u32 = PAGE_SIZE as u32 - 16;
 
 /// Maximum number of keys per node (prevents excessive allocations).
-/// Leaves pack until the page fills; internals cap at MAX_INTERNAL_KEYS.
+/// Leaves pack until the page fills; internals cap at MAX_INTERNAL_KEYS
+/// (intentional count cap so height-3 tests stay cheap; see README).
 const MAX_NUM_KEYS: u32 = 1000;
 
 /// node_type (1) + num_keys (4)
