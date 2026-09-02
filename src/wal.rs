@@ -337,8 +337,8 @@ pub mod recovery {
             pager.write_page(record.page_id, &record.data)?;
         }
 
-        // Sync the database
-        pager.file_mut().sync_all()?;
+        // Fsync the database before truncating the WAL (WAL-first durability).
+        pager.sync_file()?;
 
         // Checkpoint the WAL (clear it)
         wal.checkpoint()?;

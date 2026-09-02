@@ -1,18 +1,25 @@
 use crate::node::Node;
 use crate::pager::Pager;
+use crate::{FORMAT_VERSION, PAGE_SIZE};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-const MAX_LEAF_KEYS: usize = 3; // Reduced to 3 to support 1KB values (1024 bytes) in 4KB pages
-const MAX_INTERNAL_KEYS: usize = 10; // Maximum keys in an internal node
-/// Minimum keys in a non-root leaf: ceil(MAX_LEAF_KEYS / 2).
-const MIN_LEAF_KEYS: usize = MAX_LEAF_KEYS.div_ceil(2);
+/// Internals still use a fixed key cap so height-3 trees stay testable with
+/// short keys. Leaves pack by byte budget (`Node::leaf_fits`) instead.
+const MAX_INTERNAL_KEYS: usize = 10;
 /// Minimum keys in a non-root internal node: ceil(MAX_INTERNAL_KEYS / 2).
 const MIN_INTERNAL_KEYS: usize = MAX_INTERNAL_KEYS.div_ceil(2);
+/// Non-root leaves are underfull when encoded payload is below half a page.
+const MIN_LEAF_FILL: usize = PAGE_SIZE / 2;
 const HEADER_SIZE: usize = 100;
 const MAGIC_BYTES: &[u8] = b"BTREEDB";
 const MAGIC_BYTES_LEN: usize = 7;
+/// Byte 0 of a recycled page; distinct from leaf (0) and internal (1).
+const FREE_PAGE_MARKER: u8 = 0xFF;
+/// magic (7) + version (2) + page_size (4) + root (4) + freelist_head (4)
+const HEADER_FIXED_LEN: usize = 21;
+const RESERVED_SIZE: usize = HEADER_SIZE - HEADER_FIXED_LEN;
 
 /// Result of an insert operation that may cause a split.
 enum InsertResult {
@@ -39,21 +46,30 @@ enum DeleteResult {
 struct DatabaseHeader {
     /// Magic bytes signature: "BTREEDB"
     magic: [u8; MAGIC_BYTES_LEN],
+    /// On-disk format version
+    format_version: u16,
+    /// Page size this file was written with
+    page_size: u32,
     /// Root page ID (u32, little-endian)
     root_page_id: u32,
-    /// Reserved space for future use (100 - 7 - 4 = 89 bytes)
-    _reserved: [u8; 89],
+    /// Head of the free-page list (0 = empty)
+    freelist_head: u32,
+    /// Reserved space for future use
+    _reserved: [u8; RESERVED_SIZE],
 }
 
 impl DatabaseHeader {
-    /// Creates a new header with the given root page ID.
-    fn new(root_page_id: u32) -> Self {
+    /// Creates a new header with the given root page ID and freelist head.
+    fn new(root_page_id: u32, freelist_head: u32) -> Self {
         let mut magic = [0u8; MAGIC_BYTES_LEN];
         magic.copy_from_slice(MAGIC_BYTES);
         DatabaseHeader {
             magic,
+            format_version: FORMAT_VERSION,
+            page_size: PAGE_SIZE as u32,
             root_page_id,
-            _reserved: [0u8; 89],
+            freelist_head,
+            _reserved: [0u8; RESERVED_SIZE],
         }
     }
 
@@ -62,13 +78,12 @@ impl DatabaseHeader {
         let mut buffer = [0u8; HEADER_SIZE];
         let mut cursor = io::Cursor::new(&mut buffer[..]);
 
-        // Write magic bytes
         cursor.write_all(&self.magic)?;
-
-        // Write root_page_id (u32, little-endian)
+        cursor.write_u16::<LittleEndian>(self.format_version)?;
+        cursor.write_u32::<LittleEndian>(self.page_size)?;
         cursor.write_u32::<LittleEndian>(self.root_page_id)?;
+        cursor.write_u32::<LittleEndian>(self.freelist_head)?;
 
-        // Reserved space is already zero-padded
         Ok(buffer)
     }
 
@@ -76,11 +91,9 @@ impl DatabaseHeader {
     fn deserialize(buffer: &[u8; HEADER_SIZE]) -> io::Result<Self> {
         let mut cursor = io::Cursor::new(buffer);
 
-        // Read magic bytes
         let mut magic = [0u8; MAGIC_BYTES_LEN];
         cursor.read_exact(&mut magic)?;
 
-        // Verify magic bytes
         if magic != MAGIC_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -91,13 +104,32 @@ impl DatabaseHeader {
             ));
         }
 
-        // Read root_page_id
+        let format_version = cursor.read_u16::<LittleEndian>()?;
+        if format_version != FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported format version {format_version} (expected {FORMAT_VERSION})"),
+            ));
+        }
+
+        let page_size = cursor.read_u32::<LittleEndian>()?;
+        if page_size as usize != PAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported page size {page_size} (expected {PAGE_SIZE})"),
+            ));
+        }
+
         let root_page_id = cursor.read_u32::<LittleEndian>()?;
+        let freelist_head = cursor.read_u32::<LittleEndian>()?;
 
         Ok(DatabaseHeader {
             magic,
+            format_version,
+            page_size,
             root_page_id,
-            _reserved: [0u8; 89],
+            freelist_head,
+            _reserved: [0u8; RESERVED_SIZE],
         })
     }
 }
@@ -107,6 +139,7 @@ pub struct BTree {
     pager: Pager,
     root_page_id: u32,
     next_page_id: u32,
+    freelist_head: u32,
 }
 
 /// Database statistics returned by `BTree::stats()`.
@@ -135,18 +168,13 @@ impl BTree {
     }
 
     /// Writes the database header to page 0.
-    fn write_header(pager: &mut Pager, root_page_id: u32) -> io::Result<()> {
-        let header = DatabaseHeader::new(root_page_id);
+    fn write_header(&mut self) -> io::Result<()> {
+        let header = DatabaseHeader::new(self.root_page_id, self.freelist_head);
         let header_buffer = header.serialize()?;
 
-        // Read the current page 0
-        let mut page_buffer = pager.get_page(0)?;
-
-        // Write the header to the first 100 bytes
+        let mut page_buffer = self.pager.get_page(0)?;
         page_buffer[..HEADER_SIZE].copy_from_slice(&header_buffer);
-
-        // Write the entire page back
-        pager.write_page(0, &page_buffer)
+        self.pager.write_page(0, &page_buffer)
     }
 
     /// Opens a database file, recovers from the WAL if present, then logs writes.
@@ -165,15 +193,15 @@ impl BTree {
         }
 
         let header = Self::read_header(&mut pager)?;
-        // Derive next_page_id from actual file size to prevent page overwrites
+        // High-water mark from file size; holes are tracked by the freelist.
         let page_count = pager.page_count()?;
-        // At minimum, page 0 (header) and page 1 (root) exist
         let next_page_id = page_count.max(2);
 
         Ok(BTree {
             pager,
             root_page_id: header.root_page_id,
             next_page_id,
+            freelist_head: header.freelist_head,
         })
     }
 
@@ -186,13 +214,14 @@ impl BTree {
         let buffer = empty_leaf.serialize()?;
         pager.write_page(root_page_id, &buffer)?;
 
-        Self::write_header(&mut pager, root_page_id)?;
-
-        Ok(BTree {
+        let mut tree = BTree {
             pager,
             root_page_id,
             next_page_id,
-        })
+            freelist_head: 0,
+        };
+        tree.write_header()?;
+        Ok(tree)
     }
 
     /// Gets the root page ID.
@@ -200,10 +229,51 @@ impl BTree {
         self.root_page_id
     }
 
-    /// Syncs all data to disk, then checkpoints the WAL.
+    /// Fsyncs the database file, then checkpoints the WAL.
+    ///
+    /// Until this is called, crash safety is WAL-replay only (see [`Pager`]).
     pub fn sync(&mut self) -> io::Result<()> {
-        self.pager.file_mut().sync_all()?;
+        self.pager.sync_file()?;
         self.pager.checkpoint()
+    }
+
+    /// Allocates a page ID, reusing a freed page when the freelist is non-empty.
+    fn alloc_page(&mut self) -> io::Result<u32> {
+        if self.freelist_head == 0 {
+            let id = self.next_page_id;
+            self.next_page_id += 1;
+            return Ok(id);
+        }
+
+        let id = self.freelist_head;
+        let page = self.pager.get_page(id)?;
+        if page[0] != FREE_PAGE_MARKER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("freelist page {id} missing free marker"),
+            ));
+        }
+        let mut next = [0u8; 4];
+        next.copy_from_slice(&page[1..5]);
+        self.freelist_head = u32::from_le_bytes(next);
+        self.write_header()?;
+        Ok(id)
+    }
+
+    /// Returns `page_id` to the freelist (file size is not shrunk).
+    fn free_page(&mut self, page_id: u32) -> io::Result<()> {
+        if page_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot free header page 0",
+            ));
+        }
+        let mut page = [0u8; PAGE_SIZE];
+        page[0] = FREE_PAGE_MARKER;
+        page[1..5].copy_from_slice(&self.freelist_head.to_le_bytes());
+        self.pager.write_page(page_id, &page)?;
+        self.freelist_head = page_id;
+        self.write_header()
     }
 
     /// Returns a mutable reference to the pager.
@@ -373,6 +443,13 @@ impl BTree {
 
     /// Inserts a key-value pair into the B-Tree.
     pub fn insert(&mut self, key: &str, value: &str) -> io::Result<()> {
+        if Node::pair_encoded_len(key, value) + crate::node::NODE_HEADER_LEN > PAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "key/value pair exceeds page size",
+            ));
+        }
+
         let result = self.insert_recursive(self.root_page_id, key, value)?;
 
         match result {
@@ -404,6 +481,15 @@ impl BTree {
                 for (k, v) in pairs.iter_mut() {
                     if k == key {
                         *v = value.to_string();
+                        if !Node::leaf_fits(&pairs) {
+                            if pairs.len() < 2 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "updated value exceeds page size",
+                                ));
+                            }
+                            return self.split_leaf(page_id, pairs);
+                        }
                         let updated_node = Node::new_leaf(pairs);
                         let buffer = updated_node.serialize()?;
                         self.pager.write_page(page_id, &buffer)?;
@@ -417,12 +503,15 @@ impl BTree {
                     .unwrap_or_else(|pos| pos);
                 pairs.insert(insert_pos, (key.to_string(), value.to_string()));
 
-                // Check if we need to split
-                if pairs.len() > MAX_LEAF_KEYS {
-                    let split_result = self.split_leaf(page_id, pairs)?;
-                    Ok(split_result)
+                if !Node::leaf_fits(&pairs) {
+                    if pairs.len() < 2 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "key/value pair exceeds page size",
+                        ));
+                    }
+                    self.split_leaf(page_id, pairs)
                 } else {
-                    // Update the leaf node
                     let updated_node = Node::new_leaf(pairs);
                     let buffer = updated_node.serialize()?;
                     self.pager.write_page(page_id, &buffer)?;
@@ -443,10 +532,7 @@ impl BTree {
 
                 match result {
                     InsertResult::NoSplit => {
-                        // No split, just update this node if needed
-                        let updated_node = Node::new_internal(keys, children);
-                        let buffer = updated_node.serialize()?;
-                        self.pager.write_page(page_id, &buffer)?;
+                        // Child was updated in place; this parent is unchanged.
                         Ok(InsertResult::NoSplit)
                     }
                     InsertResult::Split {
@@ -460,12 +546,10 @@ impl BTree {
                         keys.insert(insert_pos, separator_key);
                         children.insert(insert_pos + 1, new_page_id);
 
-                        // Check if we need to split the internal node
-                        if keys.len() > MAX_INTERNAL_KEYS {
-                            let split_result = self.split_internal(page_id, keys, children)?;
-                            Ok(split_result)
+                        if keys.len() > MAX_INTERNAL_KEYS || !Node::internal_fits(&keys, &children)
+                        {
+                            self.split_internal(page_id, keys, children)
                         } else {
-                            // Update the internal node
                             let updated_node = Node::new_internal(keys, children);
                             let buffer = updated_node.serialize()?;
                             self.pager.write_page(page_id, &buffer)?;
@@ -477,31 +561,43 @@ impl BTree {
         }
     }
 
-    /// Splits a leaf node that has exceeded MAX_LEAF_KEYS.
-    /// Moves half the keys to a new leaf node.
+    /// Split point so both sides fit in a page and left is about half the bytes.
+    fn leaf_split_index(pairs: &[(String, String)]) -> usize {
+        let total = Node::leaf_encoded_len(pairs);
+        let target = total / 2;
+        let mut acc = crate::node::NODE_HEADER_LEN;
+        let mut split = 1;
+        for (i, (key, value)) in pairs.iter().enumerate().take(pairs.len().saturating_sub(1)) {
+            acc += Node::pair_encoded_len(key, value);
+            split = i + 1;
+            if acc >= target {
+                break;
+            }
+        }
+        split
+    }
+
+    /// Splits a leaf that no longer fits in a page.
+    /// Moves the right half to a new leaf.
     /// Returns the separator key (first key of the new node) and the new page ID.
     fn split_leaf(
         &mut self,
         page_id: u32,
         pairs: Vec<(String, String)>,
     ) -> io::Result<InsertResult> {
-        let split_point = pairs.len() / 2;
+        let split_point = Self::leaf_split_index(&pairs);
         let (left_pairs, right_pairs) = pairs.split_at(split_point);
 
-        // Create new leaf node with the right half
         let new_leaf = Node::new_leaf(right_pairs.to_vec());
-        let new_page_id = self.next_page_id;
-        self.next_page_id += 1;
+        let new_page_id = self.alloc_page()?;
 
         let new_buffer = new_leaf.serialize()?;
         self.pager.write_page(new_page_id, &new_buffer)?;
 
-        // Update the original leaf with the left half
         let updated_leaf = Node::new_leaf(left_pairs.to_vec());
         let updated_buffer = updated_leaf.serialize()?;
         self.pager.write_page(page_id, &updated_buffer)?;
 
-        // The separator key is the first key of the new (right) node
         let separator_key = right_pairs[0].0.clone();
 
         Ok(InsertResult::Split {
@@ -529,15 +625,12 @@ impl BTree {
         // Split children: left gets children[0..split_point+1], right gets children[split_point+1..]
         let (left_children, right_children) = children.split_at(split_point + 1);
 
-        // Create new internal node with the right half
         let new_internal = Node::new_internal(right_keys, right_children.to_vec());
-        let new_page_id = self.next_page_id;
-        self.next_page_id += 1;
+        let new_page_id = self.alloc_page()?;
 
         let new_buffer = new_internal.serialize()?;
         self.pager.write_page(new_page_id, &new_buffer)?;
 
-        // Update the original internal node with the left half
         let updated_internal = Node::new_internal(left_keys.to_vec(), left_children.to_vec());
         let updated_buffer = updated_internal.serialize()?;
         self.pager.write_page(page_id, &updated_buffer)?;
@@ -557,22 +650,20 @@ impl BTree {
     ) -> io::Result<()> {
         let new_root = Node::new_internal(vec![separator_key], vec![left_child_id, right_child_id]);
 
-        let new_root_page_id = self.next_page_id;
-        self.next_page_id += 1;
+        let new_root_page_id = self.alloc_page()?;
 
         let buffer = new_root.serialize()?;
         self.pager.write_page(new_root_page_id, &buffer)?;
 
         self.root_page_id = new_root_page_id;
-
-        // Update the header with the new root page ID
-        Self::write_header(&mut self.pager, new_root_page_id)
+        self.write_header()
     }
 
     /// Deletes a key from the B-Tree.
     /// Returns true if the key was found and deleted, false if not found.
-    /// After a non-root node drops below `ceil(MAX_*_KEYS / 2)`, borrows from a
-    /// sibling or merges so the tree stays balanced.
+    /// After a non-root leaf drops below half-page occupancy (or a non-root
+    /// internal below `ceil(MAX_INTERNAL_KEYS / 2)`), borrows from a sibling
+    /// or merges so the tree stays balanced.
     pub fn delete(&mut self, key: &str) -> io::Result<bool> {
         let result = self.delete_recursive(self.root_page_id, key)?;
 
@@ -628,8 +719,9 @@ impl BTree {
             match node {
                 Node::Internal { children, keys, .. } => {
                     if keys.is_empty() && children.len() == 1 {
+                        let old_root = self.root_page_id;
                         self.root_page_id = children[0];
-                        Self::write_header(&mut self.pager, self.root_page_id)?;
+                        self.free_page(old_root)?;
                     } else {
                         break;
                     }
@@ -638,6 +730,26 @@ impl BTree {
             }
         }
         Ok(())
+    }
+
+    fn leaf_underfull(pairs: &[(String, String)]) -> bool {
+        Node::leaf_encoded_len(pairs) < MIN_LEAF_FILL
+    }
+
+    fn leaf_can_lend_pairs(pairs: &[(String, String)]) -> bool {
+        if pairs.len() < 2 {
+            return false;
+        }
+        let last = pairs.last().expect("len >= 2");
+        Node::leaf_encoded_len(pairs) - Node::pair_encoded_len(&last.0, &last.1) >= MIN_LEAF_FILL
+    }
+
+    fn leaf_can_lend_first(pairs: &[(String, String)]) -> bool {
+        if pairs.len() < 2 {
+            return false;
+        }
+        let first = &pairs[0];
+        Node::leaf_encoded_len(pairs) - Node::pair_encoded_len(&first.0, &first.1) >= MIN_LEAF_FILL
     }
 
     /// Recursively deletes a key starting at `page_id`, then rebalances.
@@ -650,7 +762,8 @@ impl BTree {
                 match pos {
                     Some(idx) => {
                         pairs.remove(idx);
-                        let underfull = page_id != self.root_page_id && pairs.len() < MIN_LEAF_KEYS;
+                        let underfull =
+                            page_id != self.root_page_id && Self::leaf_underfull(&pairs);
                         self.store_node(page_id, &Node::new_leaf(pairs))?;
                         if underfull {
                             Ok(DeleteResult::Underflow)
@@ -716,6 +829,33 @@ impl BTree {
         })
     }
 
+    fn sibling_leaf_can_lend(&mut self, page_id: u32, from_left: bool) -> io::Result<bool> {
+        match self.load_node(page_id)? {
+            Node::Leaf { pairs, .. } => Ok(if from_left {
+                Self::leaf_can_lend_pairs(&pairs)
+            } else {
+                Self::leaf_can_lend_first(&pairs)
+            }),
+            Node::Internal { .. } => Ok(false),
+        }
+    }
+
+    fn sibling_leaf_has_extra_key(&mut self, page_id: u32) -> io::Result<bool> {
+        match self.load_node(page_id)? {
+            Node::Leaf { pairs, .. } => Ok(pairs.len() >= 2),
+            Node::Internal { .. } => Ok(false),
+        }
+    }
+
+    fn leaves_merge_fits(&mut self, left_id: u32, right_id: u32) -> io::Result<bool> {
+        match (self.load_node(left_id)?, self.load_node(right_id)?) {
+            (Node::Leaf { pairs: left, .. }, Node::Leaf { pairs: right, .. }) => {
+                Ok(Node::merged_leaf_fits(&left, &right))
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn rebalance_leaf_child(
         &mut self,
         parent_keys: &mut Vec<String>,
@@ -728,35 +868,76 @@ impl BTree {
 
         if has_left {
             let left_id = parent_children[child_index - 1];
-            if self.sibling_key_count(left_id)? > MIN_LEAF_KEYS {
-                return self.borrow_leaf_from_left(parent_keys, child_index, left_id, child_id);
+            if self.sibling_leaf_can_lend(left_id, true)? {
+                return self.borrow_leaf_from_left(
+                    parent_keys,
+                    child_index,
+                    left_id,
+                    child_id,
+                    false,
+                );
             }
         }
         if has_right {
             let right_id = parent_children[child_index + 1];
-            if self.sibling_key_count(right_id)? > MIN_LEAF_KEYS {
-                return self.borrow_leaf_from_right(parent_keys, child_index, child_id, right_id);
+            if self.sibling_leaf_can_lend(right_id, false)? {
+                return self.borrow_leaf_from_right(
+                    parent_keys,
+                    child_index,
+                    child_id,
+                    right_id,
+                    false,
+                );
             }
         }
         if has_left {
             let left_id = parent_children[child_index - 1];
-            return self.merge_leaves(
-                parent_keys,
-                parent_children,
-                child_index - 1,
-                left_id,
-                child_id,
-            );
+            if self.leaves_merge_fits(left_id, child_id)? {
+                return self.merge_leaves(
+                    parent_keys,
+                    parent_children,
+                    child_index - 1,
+                    left_id,
+                    child_id,
+                );
+            }
         }
         if has_right {
             let right_id = parent_children[child_index + 1];
-            return self.merge_leaves(
-                parent_keys,
-                parent_children,
-                child_index,
-                child_id,
-                right_id,
-            );
+            if self.leaves_merge_fits(child_id, right_id)? {
+                return self.merge_leaves(
+                    parent_keys,
+                    parent_children,
+                    child_index,
+                    child_id,
+                    right_id,
+                );
+            }
+        }
+        // Merge would overflow: steal keys even if the sibling drops below min fill.
+        if has_left {
+            let left_id = parent_children[child_index - 1];
+            if self.sibling_leaf_has_extra_key(left_id)? {
+                return self.borrow_leaf_from_left(
+                    parent_keys,
+                    child_index,
+                    left_id,
+                    child_id,
+                    true,
+                );
+            }
+        }
+        if has_right {
+            let right_id = parent_children[child_index + 1];
+            if self.sibling_leaf_has_extra_key(right_id)? {
+                return self.borrow_leaf_from_right(
+                    parent_keys,
+                    child_index,
+                    child_id,
+                    right_id,
+                    true,
+                );
+            }
         }
         Ok(())
     }
@@ -767,6 +948,7 @@ impl BTree {
         child_index: usize,
         left_id: u32,
         child_id: u32,
+        force: bool,
     ) -> io::Result<()> {
         let (mut left_pairs, mut child_pairs) =
             match (self.load_node(left_id)?, self.load_node(child_id)?) {
@@ -785,6 +967,20 @@ impl BTree {
             )
         })?;
         child_pairs.insert(0, stolen);
+        while Self::leaf_underfull(&child_pairs) {
+            let can_steal = if force {
+                left_pairs.len() >= 2
+            } else {
+                Self::leaf_can_lend_pairs(&left_pairs)
+            };
+            if !can_steal {
+                break;
+            }
+            match left_pairs.pop() {
+                Some(next) => child_pairs.insert(0, next),
+                None => break,
+            }
+        }
         parent_keys[child_index - 1] = child_pairs[0].0.clone();
         self.store_node(left_id, &Node::new_leaf(left_pairs))?;
         self.store_node(child_id, &Node::new_leaf(child_pairs))?;
@@ -797,6 +993,7 @@ impl BTree {
         child_index: usize,
         child_id: u32,
         right_id: u32,
+        force: bool,
     ) -> io::Result<()> {
         let (mut child_pairs, mut right_pairs) =
             match (self.load_node(child_id)?, self.load_node(right_id)?) {
@@ -818,6 +1015,18 @@ impl BTree {
         }
         let stolen = right_pairs.remove(0);
         child_pairs.push(stolen);
+        while Self::leaf_underfull(&child_pairs) {
+            let can_steal = if force {
+                right_pairs.len() >= 2
+            } else {
+                Self::leaf_can_lend_first(&right_pairs)
+            };
+            if !can_steal {
+                break;
+            }
+            let next = right_pairs.remove(0);
+            child_pairs.push(next);
+        }
         parent_keys[child_index] = right_pairs[0].0.clone();
         self.store_node(child_id, &Node::new_leaf(child_pairs))?;
         self.store_node(right_id, &Node::new_leaf(right_pairs))?;
@@ -843,9 +1052,16 @@ impl BTree {
                 }
             };
         left_pairs.extend(right_pairs);
+        if !Node::leaf_fits(&left_pairs) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "merged leaf exceeds page size",
+            ));
+        }
         self.store_node(left_id, &Node::new_leaf(left_pairs))?;
         parent_keys.remove(left_index);
         parent_children.remove(left_index + 1);
+        self.free_page(right_id)?;
         Ok(())
     }
 
@@ -1024,8 +1240,15 @@ impl BTree {
         left_keys.push(sep);
         left_keys.extend(right_keys);
         left_children.extend(right_children);
+        if !Node::internal_fits(&left_keys, &left_children) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "merged internal node exceeds page size",
+            ));
+        }
         self.store_node(left_id, &Node::new_internal(left_keys, left_children))?;
         parent_children.remove(left_index + 1);
+        self.free_page(right_id)?;
         Ok(())
     }
 }

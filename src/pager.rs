@@ -3,12 +3,31 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-/// Page size in bytes (4KB)
-pub const PAGE_SIZE: usize = 4096;
+pub use crate::PAGE_SIZE;
 
 /// Pager manages file I/O for a persistent B-Tree database.
 /// It handles reading and writing fixed-size pages to/from disk.
 /// When opened via [`Pager::open`], writes are logged to the WAL first.
+///
+/// # Durability policy
+///
+/// Crash safety is **WAL-first**:
+///
+/// 1. [`Pager::open`] / [`crate::btree::BTree::open`] attach a WAL. Each
+///    [`write_page`] fsyncs the page image to the WAL (`File::sync_all`), then
+///    writes the same page to the database file and `flush()`es it. The DB file
+///    is **not** fsynced on every write.
+/// 2. A crash after the WAL fsync is recovered by replaying the WAL on the next
+///    open. Replay applies pages, fsyncs the DB file, then checkpoints (truncates)
+///    the WAL.
+/// 3. [`crate::btree::BTree::sync`] fsyncs the DB file (`sync_all`) and then
+///    checkpoints the WAL. After a successful sync, the WAL is empty and the DB
+///    file is the durable copy.
+/// 4. [`Pager::new`] does **not** attach a WAL. Writes are flushed only; call
+///    [`Pager::sync_file`] (or `BTree::sync`) if the caller needs the DB file
+///    durable. This path is for tests and tools that inject pages without logging.
+///
+/// Group commit (one fsync per logical split/merge) is intentionally out of scope.
 pub struct Pager {
     file: File,
     wal: Option<WAL>,
@@ -49,6 +68,13 @@ impl Pager {
         &mut self.file
     }
 
+    /// Fsyncs the database file. Does not checkpoint the WAL.
+    ///
+    /// Used by recovery (before truncating the WAL) and by [`crate::btree::BTree::sync`].
+    pub fn sync_file(&mut self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+
     /// Returns the total number of pages in the file.
     /// Calculated as file_size / PAGE_SIZE, rounded up.
     /// Returns 0 for empty files.
@@ -85,6 +111,10 @@ impl Pager {
 
     /// Writes a page to the file at the given page_id.
     /// The data slice must be exactly PAGE_SIZE bytes.
+    ///
+    /// With a WAL attached, the page is fsynced to the WAL first; the DB file
+    /// is then written and flushed but not fsynced (see the durability policy
+    /// on [`Pager`]).
     pub fn write_page(&mut self, page_id: u32, data: &[u8]) -> std::io::Result<()> {
         if data.len() != PAGE_SIZE {
             return Err(std::io::Error::new(
@@ -111,11 +141,9 @@ impl Pager {
 
         // Write the page data
         self.file.write_all(data)?;
-        // Flush to ensure data is written (but don't sync to disk for performance)
+        // Make the write visible to the file; durability of the DB file itself
+        // waits until [`Pager::sync_file`] / [`crate::btree::BTree::sync`].
         self.file.flush()?;
-        // Note: sync_data removed for benchmarking - can cause issues with temp files
-        // In production, you may want to sync periodically rather than on every write
-        // self.file.sync_data()?;
 
         Ok(())
     }

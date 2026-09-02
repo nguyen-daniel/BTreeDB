@@ -1,21 +1,15 @@
 use btreedb::btree::BTree;
-use btreedb::pager::Pager;
-use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 
-/// Creates a temporary database file for testing.
-/// Returns a tuple of (File, TempPath) where TempPath ensures cleanup.
-fn create_temp_db() -> (std::fs::File, tempfile::TempPath) {
-    let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    temp_file.into_parts()
+/// Temporary directory plus database path. Keep the `TempDir` alive for cleanup.
+fn create_temp_db() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let path = dir.path().join("test.db");
+    (dir, path)
 }
 
-/// Opens an existing database file for testing.
-fn open_db_file(path: &std::path::Path) -> std::fs::File {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .expect("Failed to open database file")
+fn open_btree(path: &Path) -> BTree {
+    BTree::open(path).expect("Failed to open BTree")
 }
 
 fn assert_no_empty_non_root_leaves(btree: &mut BTree) {
@@ -31,16 +25,10 @@ fn assert_no_empty_non_root_leaves(btree: &mut BTree) {
 
 #[test]
 fn test_large_scale_insertion() {
-    // Create a temporary database file
-    let (file, _temp_path) = create_temp_db();
+    let (_dir, db_path) = create_temp_db();
+    let mut btree = open_btree(&db_path);
 
-    // Initialize a new database
-    let pager = Pager::new(file);
-    let mut btree = BTree::new(pager).expect("Failed to create BTree");
-
-    // Perform large-scale insertion (1000 keys) to trigger multiple B-Tree node splits
-    // With MAX_LEAF_KEYS = 3, we expect many leaf nodes, which will trigger
-    // multiple splits and potentially create internal nodes and root splits
+    // Leaves pack to a 4KB byte budget; 1000 short keys still split.
     const NUM_KEYS: usize = 1000;
 
     println!("Inserting {} keys...", NUM_KEYS);
@@ -49,10 +37,9 @@ fn test_large_scale_insertion() {
         let value = format!("value_{}", i);
         btree
             .insert(&key, &value)
-            .expect(&format!("Failed to insert key {}", i));
+            .unwrap_or_else(|_| panic!("Failed to insert key {i}"));
     }
 
-    // Verify all keys can be retrieved
     println!("Verifying all {} keys...", NUM_KEYS);
     for i in 0..NUM_KEYS {
         let key = format!("key_{:04}", i);
@@ -63,63 +50,38 @@ fn test_large_scale_insertion() {
         }
     }
 
-    // Sync all data to disk before closing
     btree.sync().expect("Failed to sync database");
-
-    // Drop the BTree to close the file
     drop(btree);
-
-    // The temp file will be automatically cleaned up when temp_path is dropped
     println!("Test completed successfully");
 }
 
 #[test]
 fn test_persistence_across_sessions() {
-    // Create a temporary database file
-    let (file, temp_path) = create_temp_db();
-    let db_path = temp_path.to_path_buf();
+    let (_dir, db_path) = create_temp_db();
 
-    // First session: Initialize database and insert data
     {
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to create BTree");
-
-        // Store the initial root page ID for verification
+        let mut btree = open_btree(&db_path);
         let initial_root_id = btree.root_page_id();
         println!("Initial root page ID: {}", initial_root_id);
 
-        // Insert some test data
         const NUM_KEYS: usize = 100;
         for i in 0..NUM_KEYS {
             let key = format!("persist_key_{:04}", i);
             let value = format!("persist_value_{}", i);
             btree
                 .insert(&key, &value)
-                .expect(&format!("Failed to insert key {}", i));
+                .unwrap_or_else(|_| panic!("Failed to insert key {i}"));
         }
 
-        // Sync and close
         btree.sync().expect("Failed to sync database");
         drop(btree);
     }
 
-    // Second session: Re-open the database file and verify persistence
     {
-        let file = open_db_file(&db_path);
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
-
-        // Persistence Check: Verify that the root page ID is correctly reloaded from disk
-        // When we re-open the database, BTree::new() reads the header from page 0,
-        // which contains the root_page_id. This test verifies that:
-        // 1. The header was correctly written to disk in the first session
-        // 2. The header is correctly read from disk in the second session
-        // 3. The root_page_id stored in the header matches the actual root of the tree
-        // 4. All data inserted in the first session is accessible in the second session
+        let mut btree = open_btree(&db_path);
         let reloaded_root_id = btree.root_page_id();
         println!("Reloaded root page ID: {}", reloaded_root_id);
 
-        // Verify all previously inserted keys are still accessible
         const NUM_KEYS: usize = 100;
         for i in 0..NUM_KEYS {
             let key = format!("persist_key_{:04}", i);
@@ -134,29 +96,21 @@ fn test_persistence_across_sessions() {
             }
         }
 
-        // Insert additional data in the second session
         btree
             .insert("new_key", "new_value")
             .expect("Failed to insert new key");
-
-        // Verify the new key is accessible
         match btree.get("new_key").expect("Failed to get new key") {
             Some(value) => assert_eq!(value, "new_value"),
             None => panic!("New key not found"),
         }
 
-        // Sync and close
         btree.sync().expect("Failed to sync database");
         drop(btree);
     }
 
-    // Third session: Verify data from both sessions persists
     {
-        let file = open_db_file(&db_path);
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to re-open BTree again");
+        let mut btree = open_btree(&db_path);
 
-        // Verify data from first session
         const NUM_KEYS: usize = 100;
         for i in 0..NUM_KEYS {
             let key = format!("persist_key_{:04}", i);
@@ -167,7 +121,6 @@ fn test_persistence_across_sessions() {
             }
         }
 
-        // Verify data from second session
         match btree.get("new_key").expect("Failed to get new key") {
             Some(value) => assert_eq!(value, "new_value"),
             None => panic!("New key not found in third session"),
@@ -176,47 +129,36 @@ fn test_persistence_across_sessions() {
         drop(btree);
     }
 
-    // The temp file will be automatically cleaned up when temp_path is dropped
     println!("Persistence test completed successfully");
 }
 
 #[test]
 fn test_root_splitting_persistence() {
-    // This test specifically verifies that root splits are correctly persisted
-    // When a root leaf node splits, a new internal root is created and the
-    // header must be updated with the new root page ID
+    let (_dir, db_path) = create_temp_db();
 
-    let (file, temp_path) = create_temp_db();
-    let db_path = temp_path.to_path_buf();
-
-    // Insert enough keys to force root splitting
-    // With MAX_LEAF_KEYS = 3, inserting 4+ keys will cause the root to split
+    // Short keys pack ~170 per leaf; insert enough to split the root leaf.
     {
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to create BTree");
+        let mut btree = open_btree(&db_path);
 
         let initial_root = btree.root_page_id();
         println!("Initial root before splits: {}", initial_root);
 
-        // Insert keys to trigger root split
-        // We need more than 3 keys to trigger a split, and then more to potentially
-        // cause the new internal root to also need updating
-        for i in 0..50 {
+        for i in 0..250 {
             let key = format!("split_key_{:04}", i);
             let value = format!("split_value_{}", i);
             btree
                 .insert(&key, &value)
-                .expect(&format!("Failed to insert key {}", i));
+                .unwrap_or_else(|_| panic!("Failed to insert key {i}"));
         }
 
         let final_root = btree.root_page_id();
         println!("Final root after splits: {}", final_root);
+        assert_ne!(
+            final_root, initial_root,
+            "root leaf should split with 250 keys"
+        );
 
-        // If root split occurred, the root page ID should have changed
-        // (unless it split and then we happened to get the same page ID, which is unlikely)
-
-        // Verify all keys are accessible
-        for i in 0..50 {
+        for i in 0..250 {
             let key = format!("split_key_{:04}", i);
             let expected_value = format!("split_value_{}", i);
             match btree.get(&key).expect("Failed to get key") {
@@ -229,21 +171,12 @@ fn test_root_splitting_persistence() {
         drop(btree);
     }
 
-    // Re-open and verify the root was correctly persisted
     {
-        let file = open_db_file(&db_path);
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
-
-        // Persistence Check: The root page ID should be correctly reloaded from the header
-        // This verifies that when the root split occurred, the header was updated
-        // with the new root page ID, and that this new root ID is correctly read
-        // when the database is re-opened
+        let mut btree = open_btree(&db_path);
         let reloaded_root = btree.root_page_id();
         println!("Reloaded root: {}", reloaded_root);
 
-        // Verify all keys are still accessible after persistence
-        for i in 0..50 {
+        for i in 0..250 {
             let key = format!("split_key_{:04}", i);
             let expected_value = format!("split_value_{}", i);
             match btree.get(&key).expect("Failed to get key") {
@@ -260,21 +193,13 @@ fn test_root_splitting_persistence() {
 
 #[test]
 fn test_inserts_after_reopen_no_page_overwrite() {
-    // This test verifies the fix for the next_page_id bug.
-    // Previously, next_page_id was estimated as root_page_id + 1 on reopen,
-    // which could cause page overwrites when the tree had grown beyond the root.
-    // Now, next_page_id is derived from the actual file size.
-
-    let (file, temp_path) = create_temp_db();
-    let db_path = temp_path.to_path_buf();
+    let (_dir, db_path) = create_temp_db();
 
     const KEYS_SESSION_1: usize = 500;
     const KEYS_SESSION_2: usize = 500;
 
-    // First session: Insert many keys to create multiple pages/splits
     {
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to create BTree");
+        let mut btree = open_btree(&db_path);
 
         println!("Session 1: Inserting {} keys...", KEYS_SESSION_1);
         for i in 0..KEYS_SESSION_1 {
@@ -282,10 +207,9 @@ fn test_inserts_after_reopen_no_page_overwrite() {
             let value = format!("session1_value_{}", i);
             btree
                 .insert(&key, &value)
-                .unwrap_or_else(|_| panic!("Failed to insert key {}", i));
+                .unwrap_or_else(|_| panic!("Failed to insert key {i}"));
         }
 
-        // Verify all session 1 keys are present
         for i in 0..KEYS_SESSION_1 {
             let key = format!("session1_key_{:04}", i);
             let expected = format!("session1_value_{}", i);
@@ -302,14 +226,9 @@ fn test_inserts_after_reopen_no_page_overwrite() {
         drop(btree);
     }
 
-    // Second session: Reopen and insert MORE keys
-    // This is where the bug would manifest - new pages would overwrite existing ones
     {
-        let file = open_db_file(&db_path);
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
+        let mut btree = open_btree(&db_path);
 
-        // First, verify session 1 keys are still accessible
         println!(
             "Session 2: Verifying {} keys from session 1...",
             KEYS_SESSION_1
@@ -326,23 +245,20 @@ fn test_inserts_after_reopen_no_page_overwrite() {
             );
         }
 
-        // Now insert more keys - this should NOT overwrite session 1 data
         println!("Session 2: Inserting {} NEW keys...", KEYS_SESSION_2);
         for i in 0..KEYS_SESSION_2 {
             let key = format!("session2_key_{:04}", i);
             let value = format!("session2_value_{}", i);
             btree
                 .insert(&key, &value)
-                .unwrap_or_else(|_| panic!("Failed to insert session 2 key {}", i));
+                .unwrap_or_else(|_| panic!("Failed to insert session 2 key {i}"));
         }
 
-        // Verify ALL keys (from both sessions) are present
         println!(
             "Session 2: Verifying all {} keys...",
             KEYS_SESSION_1 + KEYS_SESSION_2
         );
 
-        // Check session 1 keys are STILL present (this would fail with the old bug)
         for i in 0..KEYS_SESSION_1 {
             let key = format!("session1_key_{:04}", i);
             let expected = format!("session1_value_{}", i);
@@ -355,7 +271,6 @@ fn test_inserts_after_reopen_no_page_overwrite() {
             );
         }
 
-        // Check session 2 keys are present
         for i in 0..KEYS_SESSION_2 {
             let key = format!("session2_key_{:04}", i);
             let expected = format!("session2_value_{}", i);
@@ -367,11 +282,8 @@ fn test_inserts_after_reopen_no_page_overwrite() {
         drop(btree);
     }
 
-    // Third session: Final verification that everything persisted correctly
     {
-        let file = open_db_file(&db_path);
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to re-open BTree for final check");
+        let mut btree = open_btree(&db_path);
 
         println!(
             "Session 3: Final verification of all {} keys...",
@@ -410,24 +322,16 @@ fn test_inserts_after_reopen_no_page_overwrite() {
 
 #[test]
 fn test_delete_single_key() {
-    let (file, _temp_path) = create_temp_db();
-    let pager = Pager::new(file);
-    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+    let (_dir, db_path) = create_temp_db();
+    let mut btree = open_btree(&db_path);
 
-    // Insert a key
     btree.insert("key1", "value1").expect("Failed to insert");
-
-    // Verify it exists
     assert_eq!(btree.get("key1").unwrap(), Some("value1".to_string()));
 
-    // Delete it
     let deleted = btree.delete("key1").expect("Failed to delete");
     assert!(deleted, "Key should have been deleted");
-
-    // Verify it's gone
     assert_eq!(btree.get("key1").unwrap(), None);
 
-    // Try to delete again - should return false
     let deleted_again = btree.delete("key1").expect("Failed to delete again");
     assert!(!deleted_again, "Key should not exist to delete");
 
@@ -436,11 +340,9 @@ fn test_delete_single_key() {
 
 #[test]
 fn test_delete_multiple_keys() {
-    let (file, _temp_path) = create_temp_db();
-    let pager = Pager::new(file);
-    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+    let (_dir, db_path) = create_temp_db();
+    let mut btree = open_btree(&db_path);
 
-    // Insert multiple keys
     const NUM_KEYS: usize = 20;
     for i in 0..NUM_KEYS {
         let key = format!("key_{:04}", i);
@@ -448,14 +350,12 @@ fn test_delete_multiple_keys() {
         btree.insert(&key, &value).expect("Failed to insert");
     }
 
-    // Delete every other key
     for i in (0..NUM_KEYS).step_by(2) {
         let key = format!("key_{:04}", i);
         let deleted = btree.delete(&key).expect("Failed to delete");
         assert!(deleted, "Key {} should have been deleted", key);
     }
 
-    // Verify deleted keys are gone and remaining keys still exist
     for i in 0..NUM_KEYS {
         let key = format!("key_{:04}", i);
         let result = btree.get(&key).expect("Failed to get");
@@ -472,11 +372,9 @@ fn test_delete_multiple_keys() {
 
 #[test]
 fn test_delete_all_keys() {
-    let (file, _temp_path) = create_temp_db();
-    let pager = Pager::new(file);
-    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+    let (_dir, db_path) = create_temp_db();
+    let mut btree = open_btree(&db_path);
 
-    // Insert keys
     const NUM_KEYS: usize = 50;
     for i in 0..NUM_KEYS {
         let key = format!("key_{:04}", i);
@@ -484,21 +382,18 @@ fn test_delete_all_keys() {
         btree.insert(&key, &value).expect("Failed to insert");
     }
 
-    // Delete all keys
     for i in 0..NUM_KEYS {
         let key = format!("key_{:04}", i);
         let deleted = btree.delete(&key).expect("Failed to delete");
         assert!(deleted, "Key {} should have been deleted", key);
     }
 
-    // Verify all keys are gone
     for i in 0..NUM_KEYS {
         let key = format!("key_{:04}", i);
         let result = btree.get(&key).expect("Failed to get");
         assert_eq!(result, None, "Key {} should be gone", key);
     }
 
-    // Insert new keys after deletion
     for i in 0..10 {
         let key = format!("new_key_{}", i);
         let value = format!("new_value_{}", i);
@@ -507,7 +402,6 @@ fn test_delete_all_keys() {
             .expect("Failed to insert new key");
     }
 
-    // Verify new keys exist
     for i in 0..10 {
         let key = format!("new_key_{}", i);
         let expected = format!("new_value_{}", i);
@@ -520,22 +414,17 @@ fn test_delete_all_keys() {
 
 #[test]
 fn test_delete_persistence() {
-    let (file, temp_path) = create_temp_db();
-    let db_path = temp_path.to_path_buf();
+    let (_dir, db_path) = create_temp_db();
 
-    // First session: Insert and delete some keys
     {
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to create BTree");
+        let mut btree = open_btree(&db_path);
 
-        // Insert 20 keys
         for i in 0..20 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{}", i);
             btree.insert(&key, &value).expect("Failed to insert");
         }
 
-        // Delete keys 0-9
         for i in 0..10 {
             let key = format!("key_{:04}", i);
             btree.delete(&key).expect("Failed to delete");
@@ -545,13 +434,9 @@ fn test_delete_persistence() {
         drop(btree);
     }
 
-    // Second session: Verify deletions persisted
     {
-        let file = open_db_file(&db_path);
-        let pager = Pager::new(file);
-        let mut btree = BTree::new(pager).expect("Failed to re-open BTree");
+        let mut btree = open_btree(&db_path);
 
-        // Keys 0-9 should be gone
         for i in 0..10 {
             let key = format!("key_{:04}", i);
             let result = btree.get(&key).expect("Failed to get");
@@ -562,7 +447,6 @@ fn test_delete_persistence() {
             );
         }
 
-        // Keys 10-19 should still exist
         for i in 10..20 {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{}", i);
@@ -578,11 +462,9 @@ fn test_delete_persistence() {
 
 #[test]
 fn test_delete_and_reinsert() {
-    let (file, _temp_path) = create_temp_db();
-    let pager = Pager::new(file);
-    let mut btree = BTree::new(pager).expect("Failed to create BTree");
+    let (_dir, db_path) = create_temp_db();
+    let mut btree = open_btree(&db_path);
 
-    // Insert a key
     btree
         .insert("key1", "original_value")
         .expect("Failed to insert");
@@ -591,11 +473,9 @@ fn test_delete_and_reinsert() {
         Some("original_value".to_string())
     );
 
-    // Delete the key
     btree.delete("key1").expect("Failed to delete");
     assert_eq!(btree.get("key1").unwrap(), None);
 
-    // Reinsert with different value
     btree
         .insert("key1", "new_value")
         .expect("Failed to reinsert");
@@ -653,17 +533,19 @@ fn test_range_scan_after_splits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("scan.db");
     let mut btree = BTree::open(&db_path).expect("open");
-    for i in 0..80 {
+    for i in 0..400 {
         btree
             .insert(&format!("k{:03}", i), &format!("v{i}"))
             .expect("insert");
     }
+    let stats = btree.stats().expect("stats");
+    assert!(stats.leaf_count > 1, "expected splits before range scan");
     let rows = Cursor::scan_range(&mut btree, Some("k010"), Some("k020")).expect("scan");
     assert_eq!(rows.len(), 10);
     assert_eq!(rows[0].0, "k010");
     assert_eq!(rows[9].0, "k019");
     let all = Cursor::scan_range(&mut btree, None, None).expect("scan all");
-    assert_eq!(all.len(), 80);
+    assert_eq!(all.len(), 400);
 }
 
 #[test]
@@ -716,6 +598,43 @@ fn test_wal_recovers_zeroed_page() {
     );
 }
 
+/// Insert without `BTree::sync` so the WAL still has records, then zero the
+/// leaf with `Pager::new` (no WAL). Reopen must replay the write-path WAL.
+#[test]
+fn test_wal_recovers_unsynced_insert() {
+    use btreedb::pager::{Pager, PAGE_SIZE};
+    use std::fs::OpenOptions;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("unsync.db");
+
+    {
+        let mut btree = BTree::open(&db_path).expect("open");
+        btree.insert("alpha", "one").expect("insert");
+        // No sync: WAL retains the page image.
+        drop(btree);
+    }
+
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("open db");
+        let mut pager = Pager::new(file);
+        pager
+            .write_page(1, &[0u8; PAGE_SIZE])
+            .expect("zero leaf (no WAL)");
+    }
+
+    let mut btree = BTree::open(&db_path).expect("recover");
+    assert_eq!(
+        btree.get("alpha").expect("get"),
+        Some("one".to_string()),
+        "WAL from BTree::open writes should restore the leaf"
+    );
+}
+
 #[test]
 fn test_wrong_magic_fails_open() {
     use btreedb::pager::PAGE_SIZE;
@@ -755,10 +674,9 @@ fn test_delete_merge_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("merge.db");
 
-    // MAX_LEAF_KEYS = 3: 24 sequential keys force multiple leaf splits and
-    // an internal-root split (height >= 2, usually 3).
-    const INSERT: usize = 24;
-    const DELETE: usize = 16;
+    // Short keys pack ~170 per leaf; 400 keys force multiple leaves.
+    const INSERT: usize = 400;
+    const DELETE: usize = 300;
 
     let leaf_after = {
         let mut btree = BTree::open(&db_path).expect("open");
@@ -848,8 +766,9 @@ fn test_delete_internal_merge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("internal_merge.db");
 
-    const INSERT: usize = 80;
-    const DELETE: usize = 70;
+    // ~170 keys/leaf and MAX_INTERNAL_KEYS=10 → height 3 around ~1500+ keys.
+    const INSERT: usize = 2000;
+    const DELETE: usize = 1800;
 
     {
         let mut btree = BTree::open(&db_path).expect("open");
@@ -914,4 +833,55 @@ fn test_delete_internal_merge() {
         assert_eq!(scan.len(), INSERT - DELETE);
         assert_no_empty_non_root_leaves(&mut btree);
     }
+}
+
+#[test]
+fn test_freelist_reuses_pages_after_merge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("freelist.db");
+    let mut btree = BTree::open(&db_path).expect("open");
+
+    const INSERT: usize = 400;
+    for i in 0..INSERT {
+        btree
+            .insert(&format!("key_{:04}", i), &format!("value_{}", i))
+            .expect("insert");
+    }
+    let pages_after_insert = btree.stats().expect("stats").page_count;
+    assert!(pages_after_insert > 3, "expected several pages");
+
+    for i in 0..300 {
+        assert!(btree.delete(&format!("key_{:04}", i)).expect("delete"));
+    }
+    let pages_after_delete = btree.stats().expect("stats").page_count;
+    assert_eq!(
+        pages_after_delete, pages_after_insert,
+        "freelist must not shrink the file"
+    );
+
+    for i in 0..300 {
+        btree
+            .insert(&format!("key_{:04}", i), &format!("value_{}", i))
+            .expect("reinsert");
+    }
+    let pages_after_reinsert = btree.stats().expect("stats").page_count;
+    assert_eq!(
+        pages_after_reinsert, pages_after_insert,
+        "reinsert should reuse freed pages instead of growing the file"
+    );
+    assert_eq!(btree.stats().expect("stats").key_count, INSERT as u64);
+}
+
+#[test]
+fn test_oversized_pair_rejected() {
+    use btreedb::pager::PAGE_SIZE;
+    use std::io::ErrorKind;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("huge.db");
+    let mut btree = BTree::open(&db_path).expect("open");
+    let huge = "x".repeat(PAGE_SIZE);
+    let err = btree.insert("k", &huge).expect_err("must reject");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(btree.get("k").expect("get").is_none());
 }
