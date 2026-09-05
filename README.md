@@ -50,34 +50,78 @@ cargo test --features experimental
 cargo run --release
 ```
 
+`cargo run --release` starts the REPL (`default-run = "btreedb"`). The extra binary is `cargo run --release --bin bench_format`.
+
 ```
 btreedb> set name Alice
 btreedb> get name
 btreedb> scan a z
 btreedb> .stats
+btreedb> .dump
 btreedb> .exit
 ```
 
-## Proof
+### Split + persist (one command)
 
-Captured REPL session ([docs/repl_session.txt](docs/repl_session.txt)):
+40 keys with 200-byte values force a leaf split. The example dumps the tree (height ≥ 2, more than one leaf), syncs, reopens the file, and `get`s the first and last keys.
+
+```bash
+cargo run --release --example split_demo
+```
+
+Captured output ([docs/repl_session.txt](docs/repl_session.txt)):
 
 ```
-btreedb> set name Alice
-OK
-btreedb> get name
-Alice
-btreedb> scan
-name -> Alice
-(1 results)
-btreedb> .stats
+== insert 40 keys with 200-byte values ==
 Database Statistics:
-  Keys:           1
-  Tree Height:    1
-  Total Pages:    2
-  Leaf Nodes:     1
-  Internal Nodes: 0
+  Keys:           40
+  Tree Height:    2
+  Total Pages:    6
+  Leaf Nodes:     4
+  Internal Nodes: 1
+
+Tree Structure:
+[Internal@3] 3 keys: key011, key021, key031
+  [Leaf@1] 10 keys: key001, key002, ... key010
+  [Leaf@2] 10 keys: key011, key012, ... key020
+  [Leaf@4] 10 keys: key021, key022, ... key030
+  [Leaf@5] 10 keys: key031, key032, ... key040
+synced and closed
+
+== reopen <temp>/btreedb_split_demo/demo.db ==
+get key001 -> 200-byte value (persisted)
+get key040 -> 200-byte value (persisted)
+reopen stats: keys=40 height=2 leaves=4
 ```
+
+### Crash recovery (one command)
+
+Zeros a leaf after an unsynced insert, then reopens: WAL replay restores `alpha`. A second step truncates the last multi-page split frame; reopen keeps the snapshot and drops the torn write.
+
+```bash
+cargo run --release --example crash_recover
+```
+
+Captured output ([docs/crash_recover.txt](docs/crash_recover.txt)):
+
+```
+== 1. unsynced insert, then a zeroed leaf ==
+inserted alpha=one (no BTree::sync; WAL still has the page)
+zeroed leaf page 1 in the DB file (Pager::new, no WAL)
+reopen recovered alpha -> one
+
+== 2. torn last WAL frame is ignored ==
+synced 80 keys (checkpointed WAL)
+inserted through a leaf split (last key key_0168)
+last WAL frame has 4 pages (split group)
+restored pre-split DB; truncated last WAL frame 378300 -> 52 bytes
+snapshot key_0000 -> value_0 (kept)
+key_0168 -> (nil) (torn split frame ignored)
+```
+
+Same stories as `test_wal_recovers_unsynced_insert` and `test_incomplete_split_frame_is_ignored`, printed so you can watch them.
+
+## Proof
 
 | Claim | Test |
 |-------|------|
@@ -97,5 +141,7 @@ Binary vs JSONL size ([docs/format_bench.json](docs/format_bench.json), 1000 key
 
 ```bash
 cargo test --test integration_test
+cargo run --release --example split_demo
+cargo run --release --example crash_recover
 cargo run --release --bin bench_format
 ```

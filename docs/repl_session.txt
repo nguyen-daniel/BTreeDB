@@ -1,26 +1,20 @@
-B-Tree Database REPL
-Commands:
-  set <key> <value>  - Insert or update a key-value pair
-  get <key>          - Retrieve a value by key
-  delete <key>       - Delete a key-value pair
-  scan [start] [end] - Scan keys in range [start, end)
-  .stats             - Show database statistics
-  .dump              - Dump tree structure
-  .exit              - Exit and flush all data to disk
-
-btreedb> set name Alice
-OK
-btreedb> get name
-Alice
-btreedb> scan
-name -> Alice
-(1 results)
-btreedb> .stats
+== insert 40 keys with 200-byte values ==
 Database Statistics:
-  Keys:           1
-  Tree Height:    1
-  Total Pages:    2
-  Leaf Nodes:     1
-  Internal Nodes: 0
-btreedb> .exit
-All data flushed to disk. Goodbye!
+  Keys:           40
+  Tree Height:    2
+  Total Pages:    6
+  Leaf Nodes:     4
+  Internal Nodes: 1
+
+Tree Structure:
+[Internal@3] 3 keys: key011, key021, key031
+  [Leaf@1] 10 keys: key001, key002, ... key010
+  [Leaf@2] 10 keys: key011, key012, ... key020
+  [Leaf@4] 10 keys: key021, key022, ... key030
+  [Leaf@5] 10 keys: key031, key032, ... key040
+synced and closed
+
+== reopen <temp>/btreedb_split_demo/demo.db ==
+get key001 -> 200-byte value (persisted)
+get key040 -> 200-byte value (persisted)
+reopen stats: keys=40 height=2 leaves=4

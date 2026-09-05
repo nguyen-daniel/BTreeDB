@@ -1,0 +1,12 @@
+== 1. unsynced insert, then a zeroed leaf ==
+inserted alpha=one (no BTree::sync; WAL still has the page)
+zeroed leaf page 1 in the DB file (Pager::new, no WAL)
+reopen recovered alpha -> one
+
+== 2. torn last WAL frame is ignored ==
+synced 80 keys (checkpointed WAL)
+inserted through a leaf split (last key key_0168)
+last WAL frame has 4 pages (split group)
+restored pre-split DB; truncated last WAL frame 378300 -> 52 bytes
+snapshot key_0000 -> value_0 (kept)
+key_0168 -> (nil) (torn split frame ignored)
