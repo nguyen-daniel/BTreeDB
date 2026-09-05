@@ -665,6 +665,67 @@ fn test_wrong_magic_fails_open() {
     );
 }
 
+fn write_header_page(path: &Path, format_version: u16, page_size: u32) {
+    use btreedb::pager::PAGE_SIZE;
+
+    let mut page = vec![0u8; PAGE_SIZE];
+    page[..7].copy_from_slice(b"BTREEDB");
+    page[7..9].copy_from_slice(&format_version.to_le_bytes());
+    page[9..13].copy_from_slice(&page_size.to_le_bytes());
+    page[13..17].copy_from_slice(&1u32.to_le_bytes());
+    page[17..21].copy_from_slice(&0u32.to_le_bytes());
+    std::fs::write(path, page).expect("write header page");
+}
+
+#[test]
+fn test_wrong_format_version_fails_open() {
+    use btreedb::{FORMAT_VERSION, PAGE_SIZE};
+    use std::io::ErrorKind;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("old_version.db");
+    write_header_page(&db_path, 1, PAGE_SIZE as u32);
+
+    let err = match BTree::open(&db_path) {
+        Ok(_) => panic!("format version 1 must fail open on v{FORMAT_VERSION}"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("Unsupported format version 1"),
+        "error={err}"
+    );
+    assert!(
+        err.to_string()
+            .contains(&format!("expected {FORMAT_VERSION}")),
+        "error={err}"
+    );
+}
+
+#[test]
+fn test_wrong_page_size_fails_open() {
+    use btreedb::{FORMAT_VERSION, PAGE_SIZE};
+    use std::io::ErrorKind;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("bad_page.db");
+    write_header_page(&db_path, FORMAT_VERSION, 8192);
+
+    let err = match BTree::open(&db_path) {
+        Ok(_) => panic!("page size 8192 must fail open"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("Unsupported page size 8192"),
+        "error={err}"
+    );
+    assert!(
+        err.to_string().contains(&format!("expected {PAGE_SIZE}")),
+        "error={err}"
+    );
+}
+
 /// Insert enough keys to split, delete until a leaf merge fires, reopen,
 /// then check get/scan and that no non-root leaf is empty.
 #[test]
@@ -884,4 +945,206 @@ fn test_oversized_pair_rejected() {
     let err = btree.insert("k", &huge).expect_err("must reject");
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
     assert!(btree.get("k").expect("get").is_none());
+}
+
+/// Insert until a leaf split, drop without sync, zero every page in that
+/// split's WAL frame, reopen: the whole group must come back together.
+fn insert_until_leaf_split(btree: &mut BTree, start: u32) -> u32 {
+    let leaves_before = btree.stats().expect("stats").leaf_count;
+    let mut n = start;
+    loop {
+        btree
+            .insert(&format!("key_{:04}", n), &format!("value_{}", n))
+            .expect("insert");
+        n += 1;
+        if btree.stats().expect("stats").leaf_count > leaves_before {
+            return n;
+        }
+        assert!(
+            n < start + 400,
+            "expected a leaf split within 400 short keys"
+        );
+    }
+}
+
+#[test]
+fn test_wal_group_recovers_split_atomically() {
+    use btreedb::pager::{Pager, PAGE_SIZE};
+    use btreedb::wal::WAL;
+    use std::fs::OpenOptions;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("group_split.db");
+
+    let key_count = {
+        let mut btree = BTree::open(&db_path).expect("open");
+        let n = insert_until_leaf_split(&mut btree, 0);
+        assert!(btree.stats().expect("stats").tree_height >= 2);
+        drop(btree);
+        n
+    };
+
+    let last_pages = {
+        let mut wal = WAL::open(&db_path).expect("wal");
+        let frames = wal.read_frames().expect("frames");
+        let last = frames.last().expect("unsynced frames");
+        assert!(
+            last.pages.len() >= 2,
+            "split/root change must be one multi-page frame, got {}",
+            last.pages.len()
+        );
+        last.pages.iter().map(|r| r.page_id).collect::<Vec<_>>()
+    };
+
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("open db");
+        let mut pager = Pager::new(file);
+        for page_id in &last_pages {
+            pager
+                .write_page(*page_id, &[0u8; PAGE_SIZE])
+                .expect("zero grouped page");
+        }
+    }
+
+    let mut btree = BTree::open(&db_path).expect("recover");
+    for i in 0..key_count {
+        let key = format!("key_{:04}", i);
+        assert_eq!(
+            btree.get(&key).expect("get"),
+            Some(format!("value_{}", i)),
+            "missing {key} after grouped-split recovery"
+        );
+    }
+    assert_no_empty_non_root_leaves(&mut btree);
+}
+
+/// A torn multi-page split frame must not apply a prefix. Restore the
+/// pre-split snapshot and keep only a truncated last frame; reopen stays
+/// at the snapshot and remains consistent.
+#[test]
+fn test_incomplete_split_frame_is_ignored() {
+    use btreedb::wal::{WalFrame, WAL, WAL_HEADER_SIZE};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("torn_split.db");
+
+    {
+        let mut btree = BTree::open(&db_path).expect("open");
+        for i in 0..80 {
+            btree
+                .insert(&format!("key_{:04}", i), &format!("value_{}", i))
+                .expect("insert");
+        }
+        btree.sync().expect("sync");
+    }
+
+    let snapshot = std::fs::read(&db_path).expect("snapshot db");
+    let wal_path = WAL::wal_path(&db_path);
+
+    let split_key = {
+        let mut btree = BTree::open(&db_path).expect("open");
+        let n = insert_until_leaf_split(&mut btree, 80);
+        format!("key_{:04}", n - 1)
+    };
+
+    let wal_bytes = std::fs::read(&wal_path).expect("read wal");
+    let last_page_count = {
+        let mut wal = WAL::open(&db_path).expect("wal");
+        let frames = wal.read_frames().expect("frames");
+        let last = frames.last().expect("last frame");
+        assert!(
+            last.pages.len() >= 2,
+            "expected multi-page split frame, got {}",
+            last.pages.len()
+        );
+        last.pages.len()
+    };
+    let last_len = WalFrame::encoded_len(last_page_count) as usize;
+    assert!(wal_bytes.len() >= WAL_HEADER_SIZE + last_len);
+    let last_start = wal_bytes.len() - last_len;
+    // Keep the frame header plus a few bytes so page_count still claims N pages.
+    let torn_end = last_start + 20;
+    assert!(torn_end < wal_bytes.len());
+
+    std::fs::write(&db_path, snapshot).expect("restore snapshot");
+    let mut torn = wal_bytes[..WAL_HEADER_SIZE].to_vec();
+    torn.extend_from_slice(&wal_bytes[last_start..torn_end]);
+    std::fs::write(&wal_path, torn).expect("write torn wal");
+
+    let mut btree = BTree::open(&db_path).expect("open after torn frame");
+    for i in 0..80 {
+        let key = format!("key_{:04}", i);
+        assert_eq!(
+            btree.get(&key).expect("get"),
+            Some(format!("value_{}", i)),
+            "snapshot key {key} missing"
+        );
+    }
+    assert_eq!(
+        btree.get(&split_key).expect("get"),
+        None,
+        "torn split frame must not apply a prefix"
+    );
+    assert_no_empty_non_root_leaves(&mut btree);
+}
+
+#[test]
+fn test_random_ops_reopen_consistent() {
+    use btreedb::cursor::Cursor;
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("fuzz.db");
+    let mut expected: HashMap<String, String> = HashMap::new();
+    let mut rng = 0xC0FFEE_u64;
+
+    fn next_rng(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *state
+    }
+
+    for round in 0..4 {
+        let mut btree = BTree::open(&db_path).expect("open");
+        for _ in 0..60 {
+            let r = next_rng(&mut rng);
+            let key = format!("k{:03}", r % 40);
+            match r % 5 {
+                0 | 1 => {
+                    let value = format!("v{r}");
+                    btree.insert(&key, &value).expect("insert");
+                    expected.insert(key, value);
+                }
+                2 => {
+                    btree.delete(&key).expect("delete");
+                    expected.remove(&key);
+                }
+                _ => {
+                    assert_eq!(btree.get(&key).expect("get"), expected.get(&key).cloned());
+                }
+            }
+        }
+        if round % 2 == 0 {
+            btree.sync().expect("sync");
+        }
+        drop(btree);
+
+        let mut btree = BTree::open(&db_path).expect("reopen");
+        for (key, value) in &expected {
+            assert_eq!(
+                btree.get(key).expect("get").as_deref(),
+                Some(value.as_str()),
+                "mismatch for {key} after reopen"
+            );
+        }
+        let scan = Cursor::scan_range(&mut btree, None, None).expect("scan");
+        assert_eq!(scan.len(), expected.len());
+        for (key, value) in &scan {
+            assert_eq!(expected.get(key), Some(value));
+        }
+        assert_no_empty_non_root_leaves(&mut btree);
+    }
 }
