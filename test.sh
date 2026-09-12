@@ -52,6 +52,12 @@ echo "8. Building release version..."
 cargo build --release
 
 echo ""
+echo "9. Running examples..."
+cargo run --example split_demo
+cargo run --example crash_recover
+echo "   Examples OK"
+
+echo ""
 echo "========================================"
 echo "All checks passed!"
 echo "========================================"

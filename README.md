@@ -28,7 +28,9 @@ Internal nodes still split at **`MAX_INTERNAL_KEYS = 10`** (a count cap, not a b
 
 Crash safety is **WAL-first**. `insert`, `delete`, and new-file initialize buffer every page write and append **one WAL frame** (one or more page images, CRC32, one `fsync`). Then those pages are written to the DB file and `flush()`ed, not fsynced.
 
-A split, merge, root change, or freelist update that happens inside that call is therefore one atomic WAL unit: recovery replays a **complete** frame in full, or ignores a **torn last frame**. It does not replay a prefix of the group. Ungrouped `write_page` calls (tests, recovery apply) still log a one-page frame.
+A split, merge, root change, or freelist update that happens inside that call is therefore one atomic WAL unit: recovery replays a **complete** frame in full, or ignores a **torn or corrupt last frame** (short read, checksum mismatch, or invalid length). It does not replay a prefix of the group. Bytes after the last good frame are truncated so the next append does not write past unparseable data. Ungrouped `write_page` calls (tests, recovery apply) still log a one-page frame.
+
+If `insert`/`delete` fails after touching the in-memory root, page allocator, or freelist — including when `commit_write_group` logs a WAL frame and then fails to apply it to the DB file — those fields are rolled back and the just-logged frame is truncated so a later call cannot use a root or free page that was never committed.
 
 This is **not** group-commit across concurrent clients (the engine is single-threaded), and it is **not** an in-memory page cache: the write-group buffer exists only for the current `insert`/`delete` so later steps can read pages they just wrote.
 
@@ -132,6 +134,8 @@ Same stories as `test_wal_recovers_unsynced_insert` and `test_incomplete_split_f
 | Corrupt header fails open | `test_wrong_magic_fails_open`, `test_wrong_format_version_fails_open`, `test_wrong_page_size_fails_open` |
 | WAL recover | `test_wal_recovers_zeroed_page`, `test_wal_recovers_unsynced_insert` |
 | Split/merge WAL group | `test_wal_group_recovers_split_atomically`, `test_incomplete_split_frame_is_ignored` |
+| Corrupt last WAL frame ignored | `test_corrupt_last_wal_frame_is_ignored`, `test_corrupt_last_frame_is_ignored_and_tail_trimmed` |
+| Failed write rolls back allocator | `write_group_error_rolls_back_allocator_and_root`, `commit_apply_failure_rolls_back_wal_and_allocator` |
 | Random ops + reopen | `test_random_ops_reopen_consistent` |
 | Page freelist | `test_freelist_reuses_pages_after_merge` |
 

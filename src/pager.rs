@@ -19,9 +19,11 @@ pub use crate::PAGE_SIZE;
 ///    is **not** fsynced on every write.
 /// 2. [`begin_write_group`] / [`commit_write_group`] buffer page writes and
 ///    append them as **one WAL frame** (one fsync), then apply every page to
-///    the DB file. [`crate::btree::BTree::insert`] and `delete` use a group so
+///    the DB file. If the apply fails after the frame is logged, the frame
+///    is truncated so a later open does not treat the group as committed.
+///    [`crate::btree::BTree::insert`] and `delete` use a group so
 ///    a split, merge, or root change is one atomic WAL unit. Recovery replays
-///    a complete frame in full, or ignores a torn last frame — it does not
+///    a complete frame in full, or ignores a torn or corrupt last frame — it does not
 ///    apply a prefix of the group. Reads during a group see buffered pages
 ///    (no separate page cache lives across operations).
 /// 3. A crash after the WAL fsync is recovered by replaying complete frames
@@ -38,6 +40,9 @@ pub struct Pager {
     wal: Option<WAL>,
     grouping: bool,
     write_batch: Vec<(u32, [u8; PAGE_SIZE])>,
+    /// Test-only: fail the DB apply after a successful WAL log.
+    #[cfg(test)]
+    pub(crate) fail_next_apply: bool,
 }
 
 impl Pager {
@@ -48,6 +53,8 @@ impl Pager {
             wal: None,
             grouping: false,
             write_batch: Vec::new(),
+            #[cfg(test)]
+            fail_next_apply: false,
         }
     }
 
@@ -65,6 +72,8 @@ impl Pager {
             wal: None,
             grouping: false,
             write_batch: Vec::new(),
+            #[cfg(test)]
+            fail_next_apply: false,
         };
         recovery::recover(path, &mut pager)?;
         pager.wal = Some(WAL::open(path)?);
@@ -118,17 +127,40 @@ impl Pager {
             return Ok(());
         }
 
+        let wal_mark = self.wal.as_ref().map(|w| w.size());
         if let Some(wal) = &mut self.wal {
             wal.log_pages(pages)?;
         }
 
+        #[cfg(test)]
+        if self.fail_next_apply {
+            self.fail_next_apply = false;
+            self.rollback_wal(wal_mark);
+            return Err(std::io::Error::other("injected apply failure"));
+        }
+
         for (page_id, data) in pages {
             let offset = (*page_id as u64) * (PAGE_SIZE as u64);
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(data)?;
+            if let Err(err) = self
+                .file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| self.file.write_all(data))
+            {
+                self.rollback_wal(wal_mark);
+                return Err(err);
+            }
         }
-        self.file.flush()?;
+        if let Err(err) = self.file.flush() {
+            self.rollback_wal(wal_mark);
+            return Err(err);
+        }
         Ok(())
+    }
+
+    fn rollback_wal(&mut self, wal_mark: Option<u64>) {
+        if let (Some(mark), Some(wal)) = (wal_mark, &mut self.wal) {
+            let _ = wal.truncate_to(mark);
+        }
     }
 
     /// Checkpoints (truncates) the WAL after the main file is durable.

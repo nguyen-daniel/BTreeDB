@@ -1092,6 +1092,62 @@ fn test_incomplete_split_frame_is_ignored() {
     assert_no_empty_non_root_leaves(&mut btree);
 }
 
+/// A complete last WAL frame with a bad checksum must not fail open. Replay
+/// keeps earlier frames and discards the corrupt tail.
+#[test]
+fn test_corrupt_last_wal_frame_is_ignored() {
+    use btreedb::wal::{WalFrame, WAL, WAL_HEADER_SIZE};
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("corrupt_last.db");
+
+    {
+        let mut btree = BTree::open(&db_path).expect("open");
+        btree.insert("alpha", "one").expect("insert");
+        btree.sync().expect("sync");
+        btree.insert("beta", "two").expect("unsynced insert");
+        drop(btree);
+    }
+
+    let wal_path = WAL::wal_path(&db_path);
+    let wal_len = std::fs::metadata(&wal_path).expect("wal meta").len();
+    assert!(
+        wal_len > WAL_HEADER_SIZE as u64,
+        "unsynced insert must leave a WAL frame"
+    );
+
+    let mut extra = Vec::new();
+    let mut junk = [0u8; btreedb::PAGE_SIZE];
+    junk[0] = 0x5A;
+    WalFrame::from_pages(&[(99, junk)])
+        .serialize(&mut extra)
+        .expect("serialize");
+    let flip = extra.len() - 1;
+    extra[flip] ^= 0xFF;
+
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .expect("append wal");
+        file.write_all(&extra).expect("write corrupt frame");
+        file.flush().expect("flush");
+    }
+
+    let mut btree = BTree::open(&db_path).expect("open must ignore corrupt last frame");
+    assert_eq!(
+        btree.get("alpha").expect("get"),
+        Some("one".to_string()),
+        "checkpointed key missing"
+    );
+    assert_eq!(
+        btree.get("beta").expect("get"),
+        Some("two".to_string()),
+        "complete WAL frame before the corrupt tail must replay"
+    );
+}
+
 #[test]
 fn test_random_ops_reopen_consistent() {
     use btreedb::cursor::Cursor;

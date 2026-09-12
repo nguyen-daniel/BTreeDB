@@ -240,18 +240,37 @@ impl BTree {
     }
 
     /// Buffers every page write in `f` into one WAL frame, then applies them.
+    ///
+    /// If `f` fails, the page buffer is dropped **and** in-memory allocator
+    /// state (`root_page_id`, `next_page_id`, `freelist_head`) is restored so
+    /// a later `insert`/`delete` does not use a root or freelist that was
+    /// never logged.
     fn with_write_group<F, T>(&mut self, f: F) -> io::Result<T>
     where
         F: FnOnce(&mut Self) -> io::Result<T>,
     {
+        let saved_root = self.root_page_id;
+        let saved_next = self.next_page_id;
+        let saved_freelist = self.freelist_head;
         self.pager.begin_write_group()?;
         match f(self) {
             Ok(value) => {
-                self.pager.commit_write_group()?;
+                if let Err(err) = self.pager.commit_write_group() {
+                    // WAL log + DB apply did not both succeed (apply failure
+                    // truncates the frame). Restore allocator so a retry does
+                    // not fork from a root that was never committed.
+                    self.root_page_id = saved_root;
+                    self.next_page_id = saved_next;
+                    self.freelist_head = saved_freelist;
+                    return Err(err);
+                }
                 Ok(value)
             }
             Err(err) => {
                 self.pager.abort_write_group();
+                self.root_page_id = saved_root;
+                self.next_page_id = saved_next;
+                self.freelist_head = saved_freelist;
                 Err(err)
             }
         }
@@ -1293,5 +1312,72 @@ impl BTree {
         parent_children.remove(left_index + 1);
         self.free_page(right_id)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn write_group_error_rolls_back_allocator_and_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollback.db");
+        let mut btree = BTree::open(&path).unwrap();
+        btree.insert("keep", "yes").unwrap();
+
+        let root_before = btree.root_page_id;
+        let next_before = btree.next_page_id;
+        let freelist_before = btree.freelist_head;
+
+        let err = btree
+            .with_write_group(|tree| -> io::Result<()> {
+                let id = tree.alloc_page()?;
+                tree.root_page_id = id;
+                tree.write_header()?;
+                Err(io::Error::other("injected failure after metadata change"))
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "injected failure after metadata change");
+        assert_eq!(btree.root_page_id, root_before);
+        assert_eq!(btree.next_page_id, next_before);
+        assert_eq!(btree.freelist_head, freelist_before);
+        assert_eq!(btree.get("keep").unwrap().as_deref(), Some("yes"));
+
+        btree.insert("after", "ok").unwrap();
+        assert_eq!(btree.get("keep").unwrap().as_deref(), Some("yes"));
+        assert_eq!(btree.get("after").unwrap().as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn commit_apply_failure_rolls_back_wal_and_allocator() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("commit-fail.db");
+        let mut btree = BTree::open(&path).unwrap();
+        btree.insert("keep", "yes").unwrap();
+
+        let root_before = btree.root_page_id;
+        let next_before = btree.next_page_id;
+        let freelist_before = btree.freelist_head;
+
+        btree.pager.fail_next_apply = true;
+        let err = btree.insert("lost", "no").unwrap_err();
+        assert!(
+            err.to_string().contains("injected apply failure"),
+            "error={err}"
+        );
+        assert_eq!(btree.root_page_id, root_before);
+        assert_eq!(btree.next_page_id, next_before);
+        assert_eq!(btree.freelist_head, freelist_before);
+        assert_eq!(btree.get("keep").unwrap().as_deref(), Some("yes"));
+        assert_eq!(btree.get("lost").unwrap(), None);
+
+        drop(btree);
+        let mut reopened = BTree::open(&path).unwrap();
+        assert_eq!(reopened.get("keep").unwrap().as_deref(), Some("yes"));
+        assert_eq!(reopened.get("lost").unwrap(), None);
+        reopened.insert("after", "ok").unwrap();
+        assert_eq!(reopened.get("after").unwrap().as_deref(), Some("ok"));
     }
 }

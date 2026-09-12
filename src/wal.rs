@@ -3,7 +3,9 @@
 //! Page writes are logged as **frames**. One frame holds one or more page
 //! images (a single `write_page`, or every page from an `insert` / `delete`
 //! write group), a CRC32, and is fsynced once. Recovery replays complete
-//! frames only; a torn last frame is ignored.
+//! frames only. A torn last frame (short read) or a corrupt last frame
+//! (checksum / invalid length) is discarded, including any bytes after the
+//! last good frame, so the next append does not write past unparseable data.
 
 use crate::pager::PAGE_SIZE;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -342,30 +344,74 @@ impl WAL {
         self.write_offset
     }
 
+    /// Drops bytes after `offset` so a failed DB apply can undo the last frame.
+    ///
+    /// `offset` must be at or after the header. A mark at or past the current
+    /// tail is a no-op.
+    pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if offset < WAL_HEADER_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot truncate WAL below header",
+            ));
+        }
+        if offset >= self.write_offset {
+            return Ok(());
+        }
+        let file = self.file_mut()?;
+        file.set_len(offset)?;
+        file.sync_all()?;
+        self.write_offset = offset;
+        Ok(())
+    }
+
     /// Returns true if there are any records in the WAL.
     pub fn has_records(&self) -> bool {
         self.write_offset > WAL_HEADER_SIZE as u64
     }
 
-    /// Reads complete frames from the WAL. A torn last frame is omitted.
+    /// Reads complete frames from the WAL.
+    ///
+    /// A short last frame, or a last frame that fails checksum / length checks,
+    /// is omitted. Bytes after the last good frame are truncated so a later
+    /// `log_pages` overwrites the tail instead of appending past it. A bad
+    /// frame in the middle of the file also stops replay (the unreadable tail
+    /// is not applied); that matches crash-torn tails, which are always last.
     pub fn read_frames(&mut self) -> io::Result<Vec<WalFrame>> {
         if !self.enabled {
             return Ok(Vec::new());
         }
 
         let mut frames = Vec::new();
+        let mut good_end = WAL_HEADER_SIZE as u64;
 
-        let file = self.file_mut()?;
-        file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
-        let mut reader = BufReader::new(file);
+        {
+            let file = self.file_mut()?;
+            file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+            let mut reader = BufReader::new(file);
 
-        loop {
-            match WalFrame::deserialize(&mut reader) {
-                Ok(Some(frame)) => frames.push(frame),
-                Ok(None) => break, // End of file or torn last frame
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
+            loop {
+                match WalFrame::deserialize(&mut reader) {
+                    Ok(Some(frame)) => {
+                        good_end += WalFrame::encoded_len(frame.pages.len());
+                        frames.push(frame);
+                    }
+                    Ok(None) => break, // End of file or torn last frame
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData => break,
+                    Err(e) => return Err(e),
+                }
             }
+        }
+
+        if self.write_offset > good_end {
+            let file = self.file_mut()?;
+            file.set_len(good_end)?;
+            file.sync_all()?;
+            self.write_offset = good_end;
         }
 
         Ok(frames)
@@ -436,7 +482,7 @@ pub mod recovery {
             return Ok(0);
         }
 
-        // Complete frames only; a torn last frame is dropped by read_frames.
+        // Complete frames only; a torn or corrupt last frame is dropped.
         let frames = wal.read_frames()?;
         let mut count = 0;
 
@@ -636,6 +682,33 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_truncate_to_undoes_last_frame() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        File::create(&db_path).unwrap();
+
+        let mut wal = WAL::open(&db_path).unwrap();
+        let mut first = [0u8; PAGE_SIZE];
+        let mut second = [0u8; PAGE_SIZE];
+        first[0] = 1;
+        second[0] = 2;
+        wal.log_pages(&[(1, first)]).unwrap();
+        let mark = wal.size();
+        wal.log_pages(&[(2, second)]).unwrap();
+        assert_eq!(wal.read_frames().unwrap().len(), 2);
+
+        wal.truncate_to(mark).unwrap();
+        let frames = wal.read_frames().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pages[0].page_id, 1);
+
+        wal.log_pages(&[(3, second)]).unwrap();
+        let frames = wal.read_frames().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].pages[0].page_id, 3);
+    }
+
+    #[test]
     fn test_wal_rejects_old_format_version() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -656,5 +729,76 @@ mod tests {
             err.to_string().contains("Unsupported WAL format version"),
             "error={err}"
         );
+    }
+
+    #[test]
+    fn test_corrupt_last_frame_is_ignored_and_tail_trimmed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        File::create(&db_path).unwrap();
+
+        let mut wal = WAL::open(&db_path).unwrap();
+        let mut first = [0u8; PAGE_SIZE];
+        first[0] = 1;
+        wal.log_page(1, &first).unwrap();
+        let good_size = wal.size();
+        drop(wal);
+
+        let mut second = [0u8; PAGE_SIZE];
+        second[0] = 2;
+        let frame = WalFrame::from_pages(&[(2, second)]);
+        let mut extra = Vec::new();
+        frame.serialize(&mut extra).unwrap();
+        let flip = extra.len() - 1;
+        extra[flip] ^= 0xFF;
+
+        let wal_path = WAL::wal_path(&db_path);
+        {
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            file.write_all(&extra).unwrap();
+        }
+
+        let mut wal = WAL::open(&db_path).unwrap();
+        let frames = wal.read_frames().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pages[0].page_id, 1);
+        assert_eq!(frames[0].pages[0].data[0], 1);
+        assert_eq!(wal.size(), good_size);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), good_size);
+
+        let mut third = [0u8; PAGE_SIZE];
+        third[0] = 3;
+        wal.log_page(3, &third).unwrap();
+        let frames = wal.read_frames().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].pages[0].page_id, 3);
+        assert_eq!(frames[1].pages[0].data[0], 3);
+    }
+
+    #[test]
+    fn test_invalid_last_frame_length_is_ignored() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        File::create(&db_path).unwrap();
+
+        let mut wal = WAL::open(&db_path).unwrap();
+        let mut first = [0u8; PAGE_SIZE];
+        first[0] = 9;
+        wal.log_page(1, &first).unwrap();
+        let good_size = wal.size();
+        drop(wal);
+
+        let wal_path = WAL::wal_path(&db_path);
+        {
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            file.write_all(&0u32.to_le_bytes()).unwrap();
+            file.write_all(&[0xAAu8; 8]).unwrap();
+        }
+
+        let mut wal = WAL::open(&db_path).unwrap();
+        let frames = wal.read_frames().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pages[0].data[0], 9);
+        assert_eq!(wal.size(), good_size);
     }
 }

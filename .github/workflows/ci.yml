@@ -37,4 +37,9 @@ jobs:
       - name: Run tests with experimental modules
         run: cargo test --verbose --features experimental
 
+      - name: Run split and crash-recovery examples
+        run: |
+          cargo run --example split_demo
+          cargo run --example crash_recover
+
 
